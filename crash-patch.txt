@@ -22,7 +22,7 @@ Root chain: app renders chat lines from its own C++ via MSHTML markup pointers A
 page-side JS (camfrog://wb-log-im-data.inside) whose insertHtmlBeforeMessage(msg_id, html)
 needs an existing anchor element.  Wine had four gaps; all are fixed:
 
-1. Self-built mshtml (Wine 11.21, /tmp/wine-wine-11.21) refused to load as "native"
+1. Self-built mshtml (Wine 11.21, ~/camfrog/wine-src/wine-wine-11.21) refused to load as "native"
    because the PE contains the "Wine builtin DLL" signature at file offset 0x40.
    Patch: overwrite those 16 bytes (e.g. "Camfrog native!\0").  Without this, the
    prefix copy silently failed to load ("couldn't load in-process dll") and typing died.
@@ -42,7 +42,7 @@ needs an existing anchor element.  Wine had four gaps; all are fixed:
 Install state: ~/.local/share/wineprefixes/camfrog8/drive_c/windows/system32/mshtml.dll
 = patched build (also saved here as mshtml-patched.dll).
 Registry: HKCU\Software\Wine\DllOverrides  mshtml = native  (persistent, no env var needed).
-Rebuild: cd /tmp/wine-wine-11.21 && make -j8 dlls/mshtml/all, strip signature byte 0x40,
+Rebuild: cd ~/camfrog/wine-src/wine-wine-11.21 && make -j8 dlls/mshtml/all, strip signature byte 0x40,
 copy to system32.
 Known quirk: Enter sends only after a Backspace keystroke (Wine's
 TranslateAccelerator returns E_NOTIMPL, so the app never sees the keypress until the
@@ -61,7 +61,7 @@ rejects non-mix rate/channels otherwise).  20 native PCM16/float types (mix rate
 mono+stereo); Camfrog picks 48000 Hz mono PCM16.  MFCreateDeviceSource (main.c) and the
 MFEnumDeviceSources activation objects both route to create_audio_capture_source().
 Patch saved: camfrog/mf-audio-capture.patch (apply in the wine-11.21 tree with patch -p1).
-Rebuild: cd /tmp/wine-wine-11.21 && make -j16 dlls/mf/all
+Rebuild: cd ~/camfrog/wine-src/wine-wine-11.21 && make -j16 dlls/mf/all
 Install: overwrite 16 bytes at file offset 0x40 of dlls/mf/x86_64-windows/mf.dll (as for mshtml),
 copy to system32/mf.dll (original fake dll kept as system32/mf.dll.wine-orig; patched copy saved
 here as mf-patched.dll).  Registry: HKCU\Software\Wine\DllOverrides  mf = native.
@@ -135,3 +135,10 @@ content height instead: bounding rect of a range over the body's contents, in do
 coordinates, plus a bottom margin equal to the content's top offset.  One line now reads 31
 and the box only grows when a line is added (43 -> 51).  The live feed is unaffected: when
 content overflows, Gecko's own value is used.
+
+--- Where the Wine tree lives (Nov 12) ---
+The patched, configured and built Wine 11.21 tree was moved out of /tmp (systemd-tmpfiles
+removes anything there after 10 days) to ~/camfrog/wine-src/wine-wine-11.21, with the pristine
+tarball next to it as ~/camfrog/wine-src/wine-11.21.tar.gz.  Verified after the move:
+"make -j16 dlls/mf/all dlls/mshtml/all dlls/ieframe/all" rebuilds from the new location.
+wine-src/ is not part of the git repo (see .gitignore); the two .patch files are.
