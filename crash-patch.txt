@@ -123,3 +123,15 @@ oleobj.c: DocObj TranslateAccelerator has a per-thread re-entrancy guard and tra
 
 Patches: camfrog/wine-mshtml-ieframe.patch (mshtml + ieframe), camfrog/mf-audio-capture.patch.
 Built copies: mshtml-patched.dll, mf-patched.dll, camfrog/ieframe-patched.dll.
+
+--- Chat box grew taller on every keystroke (Nov 12, after the edit designer fix) ---
+Once PostHandleEvent was delivered, the app re-measured the input box after every key using
+body.scrollHeight and resized the pane to that value plus 8px.  Gecko never reports a
+scrollHeight below the client height, so the measurement returned the box's own height and the
+box grew 8px per keystroke (43, 51, 59, ... 227).  In IE the body's scrollHeight is the height
+of its content even when that is shorter than the window.
+Fix (htmlelem.c): for a BODY whose content fits (scrollHeight <= clientHeight), report the
+content height instead: bounding rect of a range over the body's contents, in document
+coordinates, plus a bottom margin equal to the content's top offset.  One line now reads 31
+and the box only grows when a line is added (43 -> 51).  The live feed is unaffected: when
+content overflows, Gecko's own value is used.

@@ -65,7 +65,91 @@
      return S_OK;
  }
  
-@@ -3594,9 +3650,38 @@
+@@ -3407,6 +3463,62 @@
+     return E_NOTIMPL;
+ }
+ 
++static BOOL is_body_element(HTMLElement *elem)
++{
++    const PRUnichar *tag;
++    nsAString tag_str;
++    BOOL ret = FALSE;
++
++    if(!elem->dom_element)
++        return FALSE;
++
++    nsAString_Init(&tag_str, NULL);
++    if(NS_SUCCEEDED(nsIDOMElement_GetTagName(elem->dom_element, &tag_str))) {
++        nsAString_GetData(&tag_str, &tag);
++        ret = !wcsicmp(tag, L"BODY");
++    }
++    nsAString_Finish(&tag_str);
++    return ret;
++}
++
++/* Height of the body's content in document coordinates, plus a bottom margin
++ * equal to the offset of the content from the top of the document. */
++static BOOL get_body_content_height(HTMLElement *This, LONG *ret)
++{
++    nsIDOMClientRect *rect = NULL;
++    float top = 0, bottom = 0;
++    LONG scroll_top = 0;
++    nsIDOMRange *range;
++    nsresult nsres;
++
++    if(!This->node.doc || !This->node.doc->dom_document)
++        return FALSE;
++
++    nsres = nsIDOMDocument_CreateRange(This->node.doc->dom_document, &range);
++    if(NS_FAILED(nsres))
++        return FALSE;
++
++    nsres = nsIDOMRange_SelectNodeContents(range, This->node.nsnode);
++    if(NS_SUCCEEDED(nsres))
++        nsres = nsIDOMRange_GetBoundingClientRect(range, &rect);
++    nsIDOMRange_Release(range);
++    if(NS_FAILED(nsres) || !rect)
++        return FALSE;
++
++    nsIDOMClientRect_GetTop(rect, &top);
++    nsIDOMClientRect_GetBottom(rect, &bottom);
++    nsIDOMClientRect_Release(rect);
++    if(bottom <= top)
++        return FALSE;
++
++    nsIDOMElement_GetScrollTop(This->dom_element, &scroll_top);
++    top += scroll_top;
++    bottom += scroll_top;
++
++    *ret = (LONG)ceilf(bottom + (top > 0 ? top : 0));
++    return TRUE;
++}
++
+ static HRESULT WINAPI HTMLElement2_get_scrollHeight(IHTMLElement2 *iface, LONG *p)
+ {
+     HTMLElement *This = impl_from_IHTMLElement2(iface);
+@@ -3421,6 +3533,20 @@
+ 
+     nsres = nsIDOMElement_GetScrollHeight(This->dom_element, p);
+     assert(nsres == NS_OK);
++
++    /* Gecko never reports a scrollHeight smaller than the client height. In IE the
++     * body's scrollHeight is the height of its content, even when that is shorter
++     * than the window; hosts size their windows to fit the content this way. */
++    if(is_body_element(This)) {
++        LONG client_height = 0, content_height;
++
++        nsIDOMElement_GetClientHeight(This->dom_element, &client_height);
++        if(*p <= client_height && get_body_content_height(This, &content_height) && content_height < *p) {
++            TRACE("content fits: %ld -> %ld\n", *p, content_height);
++            *p = content_height;
++        }
++    }
++
+     TRACE("*p = %ld\n", *p);
+     return S_OK;
+ }
+@@ -3594,9 +3720,38 @@
  
  static HRESULT WINAPI HTMLElement2_get_canHandleChildren(IHTMLElement2 *iface, VARIANT_BOOL *p)
  {

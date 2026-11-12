@@ -15,6 +15,7 @@ Nothing here contains Camfrog binaries. The patches are against the Wine 11.21 s
 | Live room chat log | works | `IMarkupPointer::Left`, `IHTMLElement2::doScroll` and `get_canHandleChildren` were stubs |
 | Room agreement (MOTD) page | works | same three stubs; the pane is the same kind of page as the chat log |
 | Enter sends a chat line | works | `IHTMLEditServices::AddDesigner` was a stub, so the app never saw typed text |
+| Chat box keeps its height while typing | works | `body.scrollHeight` never went below the box height, unlike IE, so the app grew the box on every key |
 | Room text rendering at all | works | earlier fixes: markup pointers, `styleSheet.ownerNode`, one patched page script |
 | Incoming audio and video | worked already | |
 
