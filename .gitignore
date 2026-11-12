@@ -1,0 +1,12 @@
+# Publish notes, patches and scripts only.
+# Camfrog binaries, built DLLs, the registry export (personal settings and block
+# list) and screenshots (other people's names and chat) stay local.
+*
+!.gitignore
+!README.md
+!crash-patch.txt
+!camfrog/
+camfrog/*
+!camfrog/*.py
+!camfrog/*.sh
+!camfrog/*.patch

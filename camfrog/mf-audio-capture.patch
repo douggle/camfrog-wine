@@ -1,0 +1,945 @@
+--- a/dlls/mf/sac.c	2026-10-30 13:52:31.000000000 -0700
++++ b/dlls/mf/sac.c	2026-11-12 07:04:17.966816949 -0800
+@@ -28,14 +28,903 @@
+ #include "devpkey.h"
+ 
+ #include "wine/debug.h"
++#include "wine/list.h"
+ 
+ WINE_DEFAULT_DEBUG_CHANNEL(mfplat);
+ 
++/*
++ * Audio capture media source (local addition for Camfrog): a live IMFMediaSource with a
++ * single PCM stream, fed by a WASAPI shared-mode capture client.
++ */
++
++static const GUID sac_IID_IAudioClient = {0x1cb9ad4c,0xdbfa,0x4c32,{0xb1,0x78,0xc2,0xf5,0x68,0xa7,0x03,0xb2}};
++static const GUID sac_IID_IAudioCaptureClient = {0xc8adbd64,0xe71e,0x48a0,{0xa4,0xde,0x18,0x5c,0x39,0x5c,0xd3,0x17}};
++
++#define SAC_MAX_QUEUED_SAMPLES 100
++#define SAC_MAX_TYPES 32
++
++enum sac_state
++{
++    SAC_STATE_STOPPED = 0,
++    SAC_STATE_RUNNING,
++    SAC_STATE_PAUSED,
++    SAC_STATE_SHUTDOWN,
++};
++
++struct sac_sample
++{
++    struct list entry;
++    IMFSample *sample;
++};
++
++struct sac_request
++{
++    struct list entry;
++    IUnknown *token;
++};
++
++struct audio_capture_source
++{
++    IMFMediaSource IMFMediaSource_iface;
++    IMFMediaStream IMFMediaStream_iface;
++    LONG refcount;
++
++    IMFMediaEventQueue *event_queue;
++    IMFMediaEventQueue *stream_event_queue;
++    IMFPresentationDescriptor *pd;
++    IMFStreamDescriptor *sd;
++
++    WCHAR *endpoint_id;
++    ERole role;
++
++    CRITICAL_SECTION cs;
++    enum sac_state state;
++    BOOL stream_sent;
++
++    WAVEFORMATEX *format;
++    HANDLE thread;
++    HANDLE stop_event;
++    HANDLE ready_event;
++    HRESULT thread_hr;
++
++    struct list samples;
++    unsigned int sample_count;
++    struct list requests;
++};
++
++static struct audio_capture_source *impl_from_IMFMediaSource(IMFMediaSource *iface)
++{
++    return CONTAINING_RECORD(iface, struct audio_capture_source, IMFMediaSource_iface);
++}
++
++static struct audio_capture_source *impl_from_IMFMediaStream(IMFMediaStream *iface)
++{
++    return CONTAINING_RECORD(iface, struct audio_capture_source, IMFMediaStream_iface);
++}
++
++static HRESULT sac_open_device(const WCHAR *endpoint_id, ERole role, IMMDevice **device)
++{
++    IMMDeviceEnumerator *devenum;
++    HRESULT hr;
++
++    *device = NULL;
++    if (FAILED(hr = CoCreateInstance(&CLSID_MMDeviceEnumerator, NULL, CLSCTX_INPROC_SERVER,
++            &IID_IMMDeviceEnumerator, (void **)&devenum)))
++        return hr;
++
++    hr = E_FAIL;
++    if (endpoint_id && FAILED(hr = IMMDeviceEnumerator_GetDevice(devenum, endpoint_id, device)))
++        WARN("Failed to open endpoint %s, hr %#lx, using the default one.\n", debugstr_w(endpoint_id), hr);
++    if (FAILED(hr))
++        hr = IMMDeviceEnumerator_GetDefaultAudioEndpoint(devenum, eCapture, role, device);
++
++    IMMDeviceEnumerator_Release(devenum);
++    return hr;
++}
++
++/* Called with source->cs held. */
++static void sac_deliver_samples(struct audio_capture_source *source)
++{
++    struct sac_request *request;
++    struct sac_sample *sample;
++    struct list *r, *s;
++
++    while ((r = list_head(&source->requests)) && (s = list_head(&source->samples)))
++    {
++        request = LIST_ENTRY(r, struct sac_request, entry);
++        sample = LIST_ENTRY(s, struct sac_sample, entry);
++        list_remove(r);
++        list_remove(s);
++        --source->sample_count;
++
++        if (request->token)
++        {
++            IMFSample_SetUnknown(sample->sample, &MFSampleExtension_Token, request->token);
++            IUnknown_Release(request->token);
++        }
++        IMFMediaEventQueue_QueueEventParamUnk(source->stream_event_queue, MEMediaSample, &GUID_NULL, S_OK,
++                (IUnknown *)sample->sample);
++        IMFSample_Release(sample->sample);
++        free(sample);
++        free(request);
++    }
++}
++
++/* Called with source->cs held. */
++static void sac_flush(struct audio_capture_source *source)
++{
++    struct sac_request *request, *request2;
++    struct sac_sample *sample, *sample2;
++
++    LIST_FOR_EACH_ENTRY_SAFE(sample, sample2, &source->samples, struct sac_sample, entry)
++    {
++        list_remove(&sample->entry);
++        IMFSample_Release(sample->sample);
++        free(sample);
++    }
++    source->sample_count = 0;
++
++    LIST_FOR_EACH_ENTRY_SAFE(request, request2, &source->requests, struct sac_request, entry)
++    {
++        list_remove(&request->entry);
++        if (request->token)
++            IUnknown_Release(request->token);
++        free(request);
++    }
++}
++
++static void sac_queue_captured(struct audio_capture_source *source, const BYTE *data, UINT32 frames,
++        DWORD flags, const WAVEFORMATEX *format, UINT64 position)
++{
++    DWORD size = frames * format->nBlockAlign;
++    struct sac_sample *entry, *oldest;
++    IMFMediaBuffer *buffer;
++    IMFSample *sample;
++    BYTE *dst;
++
++    if (FAILED(MFCreateMemoryBuffer(size, &buffer)))
++        return;
++    if (SUCCEEDED(IMFMediaBuffer_Lock(buffer, &dst, NULL, NULL)))
++    {
++        if (flags & AUDCLNT_BUFFERFLAGS_SILENT)
++            memset(dst, 0, size);
++        else
++            memcpy(dst, data, size);
++        IMFMediaBuffer_Unlock(buffer);
++    }
++    IMFMediaBuffer_SetCurrentLength(buffer, size);
++
++    if (FAILED(MFCreateSample(&sample)))
++    {
++        IMFMediaBuffer_Release(buffer);
++        return;
++    }
++    IMFSample_AddBuffer(sample, buffer);
++    IMFMediaBuffer_Release(buffer);
++    IMFSample_SetSampleTime(sample, (LONGLONG)(position * 10000000 / format->nSamplesPerSec));
++    IMFSample_SetSampleDuration(sample, (LONGLONG)((UINT64)frames * 10000000 / format->nSamplesPerSec));
++
++    if (!(entry = calloc(1, sizeof(*entry))))
++    {
++        IMFSample_Release(sample);
++        return;
++    }
++    entry->sample = sample;
++
++    EnterCriticalSection(&source->cs);
++    if (source->state != SAC_STATE_RUNNING)
++    {
++        IMFSample_Release(sample);
++        free(entry);
++    }
++    else
++    {
++        list_add_tail(&source->samples, &entry->entry);
++        if (++source->sample_count > SAC_MAX_QUEUED_SAMPLES)
++        {
++            oldest = LIST_ENTRY(list_head(&source->samples), struct sac_sample, entry);
++            list_remove(&oldest->entry);
++            IMFSample_Release(oldest->sample);
++            free(oldest);
++            --source->sample_count;
++        }
++        sac_deliver_samples(source);
++    }
++    LeaveCriticalSection(&source->cs);
++}
++
++static DWORD CALLBACK sac_capture_thread(void *arg)
++{
++    struct audio_capture_source *source = arg;
++    const WAVEFORMATEX *format = source->format;
++    IAudioCaptureClient *capture = NULL;
++    IAudioClient *client = NULL;
++    IMMDevice *device = NULL;
++    UINT64 position = 0;
++    HRESULT hr, coinit;
++
++    coinit = CoInitializeEx(NULL, COINIT_MULTITHREADED);
++
++    if (SUCCEEDED(hr = sac_open_device(source->endpoint_id, source->role, &device)))
++        hr = IMMDevice_Activate(device, &sac_IID_IAudioClient, CLSCTX_INPROC_SERVER, NULL, (void **)&client);
++    if (SUCCEEDED(hr))
++        hr = IAudioClient_Initialize(client, AUDCLNT_SHAREMODE_SHARED,
++                AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM | AUDCLNT_STREAMFLAGS_SRC_DEFAULT_QUALITY,
++                10000000, 0, format, NULL);
++    if (SUCCEEDED(hr))
++        hr = IAudioClient_GetService(client, &sac_IID_IAudioCaptureClient, (void **)&capture);
++    if (SUCCEEDED(hr))
++        hr = IAudioClient_Start(client);
++
++    TRACE("source %p, capture start hr %#lx (%u Hz, %u ch, %u bits, tag %#x).\n", source, hr,
++            (unsigned int)format->nSamplesPerSec, format->nChannels, format->wBitsPerSample, format->wFormatTag);
++
++    source->thread_hr = hr;
++    SetEvent(source->ready_event);
++
++    if (SUCCEEDED(hr))
++    {
++        while (WaitForSingleObject(source->stop_event, 10) == WAIT_TIMEOUT)
++        {
++            for (;;)
++            {
++                UINT32 packet = 0, frames = 0;
++                DWORD flags = 0;
++                BYTE *data;
++
++                if (FAILED(IAudioCaptureClient_GetNextPacketSize(capture, &packet)) || !packet)
++                    break;
++                if (IAudioCaptureClient_GetBuffer(capture, &data, &frames, &flags, NULL, NULL) != S_OK)
++                    break;
++                if (frames)
++                    sac_queue_captured(source, data, frames, flags, format, position);
++                position += frames;
++                IAudioCaptureClient_ReleaseBuffer(capture, frames);
++            }
++        }
++        IAudioClient_Stop(client);
++    }
++
++    if (capture)
++        IAudioCaptureClient_Release(capture);
++    if (client)
++        IAudioClient_Release(client);
++    if (device)
++        IMMDevice_Release(device);
++    if (SUCCEEDED(coinit))
++        CoUninitialize();
++
++    TRACE("source %p, capture thread exiting.\n", source);
++    return 0;
++}
++
++/* Must be called without source->cs held. */
++static void sac_stop_thread(struct audio_capture_source *source)
++{
++    HANDLE thread;
++
++    EnterCriticalSection(&source->cs);
++    thread = source->thread;
++    source->thread = NULL;
++    LeaveCriticalSection(&source->cs);
++
++    if (thread)
++    {
++        SetEvent(source->stop_event);
++        WaitForSingleObject(thread, INFINITE);
++        CloseHandle(thread);
++        ResetEvent(source->stop_event);
++    }
++}
++
++static HRESULT sac_get_selected_format(struct audio_capture_source *source, IMFPresentationDescriptor *pd,
++        WAVEFORMATEX **format)
++{
++    IMFMediaTypeHandler *handler;
++    IMFStreamDescriptor *sd = NULL;
++    IMFMediaType *type = NULL;
++    BOOL selected;
++    UINT32 size;
++    HRESULT hr;
++
++    *format = NULL;
++
++    if (!pd || FAILED(IMFPresentationDescriptor_GetStreamDescriptorByIndex(pd, 0, &selected, &sd)))
++    {
++        sd = source->sd;
++        IMFStreamDescriptor_AddRef(sd);
++    }
++
++    hr = IMFStreamDescriptor_GetMediaTypeHandler(sd, &handler);
++    IMFStreamDescriptor_Release(sd);
++    if (FAILED(hr))
++        return hr;
++
++    if (FAILED(hr = IMFMediaTypeHandler_GetCurrentMediaType(handler, &type)))
++        hr = IMFMediaTypeHandler_GetMediaTypeByIndex(handler, 0, &type);
++    IMFMediaTypeHandler_Release(handler);
++    if (FAILED(hr))
++        return hr;
++
++    hr = MFCreateWaveFormatExFromMFMediaType(type, format, &size, MFWaveFormatExConvertFlag_Normal);
++    IMFMediaType_Release(type);
++    if (FAILED(hr))
++        return hr;
++
++    if (((*format)->wFormatTag != WAVE_FORMAT_PCM && (*format)->wFormatTag != WAVE_FORMAT_IEEE_FLOAT)
++            || !(*format)->nChannels || (*format)->nChannels > 2 || !(*format)->nSamplesPerSec
++            || !(*format)->nBlockAlign)
++    {
++        WARN("Unsupported capture format (tag %#x, %u ch).\n", (*format)->wFormatTag, (*format)->nChannels);
++        CoTaskMemFree(*format);
++        *format = NULL;
++        return MF_E_INVALIDMEDIATYPE;
++    }
++
++    return S_OK;
++}
++
++static void sac_source_destroy(struct audio_capture_source *source)
++{
++    sac_stop_thread(source);
++
++    EnterCriticalSection(&source->cs);
++    sac_flush(source);
++    LeaveCriticalSection(&source->cs);
++
++    if (source->event_queue)
++    {
++        IMFMediaEventQueue_Shutdown(source->event_queue);
++        IMFMediaEventQueue_Release(source->event_queue);
++    }
++    if (source->stream_event_queue)
++    {
++        IMFMediaEventQueue_Shutdown(source->stream_event_queue);
++        IMFMediaEventQueue_Release(source->stream_event_queue);
++    }
++    if (source->pd)
++        IMFPresentationDescriptor_Release(source->pd);
++    if (source->sd)
++        IMFStreamDescriptor_Release(source->sd);
++    if (source->stop_event)
++        CloseHandle(source->stop_event);
++    if (source->ready_event)
++        CloseHandle(source->ready_event);
++    CoTaskMemFree(source->format);
++    free(source->endpoint_id);
++    DeleteCriticalSection(&source->cs);
++    free(source);
++}
++
++/* IMFMediaStream */
++
++static HRESULT WINAPI sac_stream_QueryInterface(IMFMediaStream *iface, REFIID riid, void **out)
++{
++    TRACE("%p, %s, %p.\n", iface, debugstr_guid(riid), out);
++
++    if (IsEqualIID(riid, &IID_IMFMediaStream)
++            || IsEqualIID(riid, &IID_IMFMediaEventGenerator)
++            || IsEqualIID(riid, &IID_IUnknown))
++    {
++        *out = iface;
++        IMFMediaStream_AddRef(iface);
++        return S_OK;
++    }
++
++    *out = NULL;
++    return E_NOINTERFACE;
++}
++
++static ULONG WINAPI sac_stream_AddRef(IMFMediaStream *iface)
++{
++    struct audio_capture_source *source = impl_from_IMFMediaStream(iface);
++    return IMFMediaSource_AddRef(&source->IMFMediaSource_iface);
++}
++
++static ULONG WINAPI sac_stream_Release(IMFMediaStream *iface)
++{
++    struct audio_capture_source *source = impl_from_IMFMediaStream(iface);
++    return IMFMediaSource_Release(&source->IMFMediaSource_iface);
++}
++
++static HRESULT WINAPI sac_stream_GetEvent(IMFMediaStream *iface, DWORD flags, IMFMediaEvent **event)
++{
++    struct audio_capture_source *source = impl_from_IMFMediaStream(iface);
++    return IMFMediaEventQueue_GetEvent(source->stream_event_queue, flags, event);
++}
++
++static HRESULT WINAPI sac_stream_BeginGetEvent(IMFMediaStream *iface, IMFAsyncCallback *callback, IUnknown *state)
++{
++    struct audio_capture_source *source = impl_from_IMFMediaStream(iface);
++    return IMFMediaEventQueue_BeginGetEvent(source->stream_event_queue, callback, state);
++}
++
++static HRESULT WINAPI sac_stream_EndGetEvent(IMFMediaStream *iface, IMFAsyncResult *result, IMFMediaEvent **event)
++{
++    struct audio_capture_source *source = impl_from_IMFMediaStream(iface);
++    return IMFMediaEventQueue_EndGetEvent(source->stream_event_queue, result, event);
++}
++
++static HRESULT WINAPI sac_stream_QueueEvent(IMFMediaStream *iface, MediaEventType event_type, REFGUID ext_type,
++        HRESULT hr, const PROPVARIANT *value)
++{
++    struct audio_capture_source *source = impl_from_IMFMediaStream(iface);
++    return IMFMediaEventQueue_QueueEventParamVar(source->stream_event_queue, event_type, ext_type, hr, value);
++}
++
++static HRESULT WINAPI sac_stream_GetMediaSource(IMFMediaStream *iface, IMFMediaSource **out)
++{
++    struct audio_capture_source *source = impl_from_IMFMediaStream(iface);
++
++    TRACE("%p, %p.\n", iface, out);
++
++    if (source->state == SAC_STATE_SHUTDOWN)
++        return MF_E_SHUTDOWN;
++
++    *out = &source->IMFMediaSource_iface;
++    IMFMediaSource_AddRef(*out);
++    return S_OK;
++}
++
++static HRESULT WINAPI sac_stream_GetStreamDescriptor(IMFMediaStream *iface, IMFStreamDescriptor **sd)
++{
++    struct audio_capture_source *source = impl_from_IMFMediaStream(iface);
++
++    TRACE("%p, %p.\n", iface, sd);
++
++    if (source->state == SAC_STATE_SHUTDOWN)
++        return MF_E_SHUTDOWN;
++
++    *sd = source->sd;
++    IMFStreamDescriptor_AddRef(*sd);
++    return S_OK;
++}
++
++static HRESULT WINAPI sac_stream_RequestSample(IMFMediaStream *iface, IUnknown *token)
++{
++    struct audio_capture_source *source = impl_from_IMFMediaStream(iface);
++    struct sac_request *request;
++    HRESULT hr = S_OK;
++
++    TRACE("%p, %p.\n", iface, token);
++
++    EnterCriticalSection(&source->cs);
++    if (source->state == SAC_STATE_SHUTDOWN)
++        hr = MF_E_SHUTDOWN;
++    else if (source->state == SAC_STATE_STOPPED)
++        hr = MF_E_MEDIA_SOURCE_WRONGSTATE;
++    else if (!(request = calloc(1, sizeof(*request))))
++        hr = E_OUTOFMEMORY;
++    else
++    {
++        if ((request->token = token))
++            IUnknown_AddRef(token);
++        list_add_tail(&source->requests, &request->entry);
++        sac_deliver_samples(source);
++    }
++    LeaveCriticalSection(&source->cs);
++
++    return hr;
++}
++
++static const IMFMediaStreamVtbl sac_stream_vtbl =
++{
++    sac_stream_QueryInterface,
++    sac_stream_AddRef,
++    sac_stream_Release,
++    sac_stream_GetEvent,
++    sac_stream_BeginGetEvent,
++    sac_stream_EndGetEvent,
++    sac_stream_QueueEvent,
++    sac_stream_GetMediaSource,
++    sac_stream_GetStreamDescriptor,
++    sac_stream_RequestSample,
++};
++
++/* IMFMediaSource */
++
++static HRESULT WINAPI sac_source_QueryInterface(IMFMediaSource *iface, REFIID riid, void **out)
++{
++    TRACE("%p, %s, %p.\n", iface, debugstr_guid(riid), out);
++
++    if (IsEqualIID(riid, &IID_IMFMediaSource)
++            || IsEqualIID(riid, &IID_IMFMediaEventGenerator)
++            || IsEqualIID(riid, &IID_IUnknown))
++    {
++        *out = iface;
++        IMFMediaSource_AddRef(iface);
++        return S_OK;
++    }
++
++    *out = NULL;
++    return E_NOINTERFACE;
++}
++
++static ULONG WINAPI sac_source_AddRef(IMFMediaSource *iface)
++{
++    struct audio_capture_source *source = impl_from_IMFMediaSource(iface);
++    return InterlockedIncrement(&source->refcount);
++}
++
++static ULONG WINAPI sac_source_Release(IMFMediaSource *iface)
++{
++    struct audio_capture_source *source = impl_from_IMFMediaSource(iface);
++    ULONG refcount = InterlockedDecrement(&source->refcount);
++
++    if (!refcount)
++        sac_source_destroy(source);
++
++    return refcount;
++}
++
++static HRESULT WINAPI sac_source_GetEvent(IMFMediaSource *iface, DWORD flags, IMFMediaEvent **event)
++{
++    struct audio_capture_source *source = impl_from_IMFMediaSource(iface);
++    return IMFMediaEventQueue_GetEvent(source->event_queue, flags, event);
++}
++
++static HRESULT WINAPI sac_source_BeginGetEvent(IMFMediaSource *iface, IMFAsyncCallback *callback, IUnknown *state)
++{
++    struct audio_capture_source *source = impl_from_IMFMediaSource(iface);
++    return IMFMediaEventQueue_BeginGetEvent(source->event_queue, callback, state);
++}
++
++static HRESULT WINAPI sac_source_EndGetEvent(IMFMediaSource *iface, IMFAsyncResult *result, IMFMediaEvent **event)
++{
++    struct audio_capture_source *source = impl_from_IMFMediaSource(iface);
++    return IMFMediaEventQueue_EndGetEvent(source->event_queue, result, event);
++}
++
++static HRESULT WINAPI sac_source_QueueEvent(IMFMediaSource *iface, MediaEventType event_type, REFGUID ext_type,
++        HRESULT hr, const PROPVARIANT *value)
++{
++    struct audio_capture_source *source = impl_from_IMFMediaSource(iface);
++    return IMFMediaEventQueue_QueueEventParamVar(source->event_queue, event_type, ext_type, hr, value);
++}
++
++static HRESULT WINAPI sac_source_GetCharacteristics(IMFMediaSource *iface, DWORD *characteristics)
++{
++    struct audio_capture_source *source = impl_from_IMFMediaSource(iface);
++
++    TRACE("%p, %p.\n", iface, characteristics);
++
++    if (source->state == SAC_STATE_SHUTDOWN)
++        return MF_E_SHUTDOWN;
++
++    *characteristics = MFMEDIASOURCE_IS_LIVE;
++    return S_OK;
++}
++
++static HRESULT WINAPI sac_source_CreatePresentationDescriptor(IMFMediaSource *iface, IMFPresentationDescriptor **pd)
++{
++    struct audio_capture_source *source = impl_from_IMFMediaSource(iface);
++
++    TRACE("%p, %p.\n", iface, pd);
++
++    if (source->state == SAC_STATE_SHUTDOWN)
++        return MF_E_SHUTDOWN;
++
++    return IMFPresentationDescriptor_Clone(source->pd, pd);
++}
++
++static HRESULT WINAPI sac_source_Start(IMFMediaSource *iface, IMFPresentationDescriptor *pd, const GUID *time_format,
++        const PROPVARIANT *position)
++{
++    struct audio_capture_source *source = impl_from_IMFMediaSource(iface);
++    WAVEFORMATEX *format = NULL;
++    BOOL restart = FALSE;
++    PROPVARIANT empty;
++    HRESULT hr;
++
++    TRACE("%p, %p, %s, %p.\n", iface, pd, debugstr_guid(time_format), position);
++
++    if (time_format && !IsEqualGUID(time_format, &GUID_NULL))
++        return MF_E_UNSUPPORTED_TIME_FORMAT;
++
++    PropVariantInit(&empty);
++    if (!position)
++        position = &empty;
++
++    if (source->state == SAC_STATE_SHUTDOWN)
++        return MF_E_SHUTDOWN;
++
++    if (FAILED(hr = sac_get_selected_format(source, pd, &format)))
++        return hr;
++
++    EnterCriticalSection(&source->cs);
++    if (source->thread && source->format && (source->format->wFormatTag != format->wFormatTag
++            || source->format->nChannels != format->nChannels
++            || source->format->nSamplesPerSec != format->nSamplesPerSec
++            || source->format->wBitsPerSample != format->wBitsPerSample))
++        restart = TRUE;
++    LeaveCriticalSection(&source->cs);
++
++    if (restart)
++        sac_stop_thread(source);
++
++    EnterCriticalSection(&source->cs);
++
++    if (source->state == SAC_STATE_SHUTDOWN)
++        hr = MF_E_SHUTDOWN;
++    else if (!source->thread)
++    {
++        sac_flush(source);
++        CoTaskMemFree(source->format);
++        source->format = format;
++        format = NULL;
++
++        ResetEvent(source->ready_event);
++        ResetEvent(source->stop_event);
++        source->thread_hr = E_FAIL;
++        if (!(source->thread = CreateThread(NULL, 0, sac_capture_thread, source, 0, NULL)))
++            hr = HRESULT_FROM_WIN32(GetLastError());
++        else
++        {
++            WaitForSingleObject(source->ready_event, INFINITE);
++            if (FAILED(hr = source->thread_hr))
++            {
++                WaitForSingleObject(source->thread, INFINITE);
++                CloseHandle(source->thread);
++                source->thread = NULL;
++            }
++        }
++    }
++
++    if (SUCCEEDED(hr))
++    {
++        source->state = SAC_STATE_RUNNING;
++        IMFMediaEventQueue_QueueEventParamUnk(source->event_queue, source->stream_sent ? MEUpdatedStream : MENewStream,
++                &GUID_NULL, S_OK, (IUnknown *)&source->IMFMediaStream_iface);
++        source->stream_sent = TRUE;
++        IMFMediaEventQueue_QueueEventParamVar(source->event_queue, MESourceStarted, &GUID_NULL, S_OK, position);
++        IMFMediaEventQueue_QueueEventParamVar(source->stream_event_queue, MEStreamStarted, &GUID_NULL, S_OK, position);
++    }
++    else
++        WARN("Failed to start audio capture, hr %#lx.\n", hr);
++
++    LeaveCriticalSection(&source->cs);
++
++    CoTaskMemFree(format);
++    return hr;
++}
++
++static HRESULT WINAPI sac_source_Stop(IMFMediaSource *iface)
++{
++    struct audio_capture_source *source = impl_from_IMFMediaSource(iface);
++
++    TRACE("%p.\n", iface);
++
++    if (source->state == SAC_STATE_SHUTDOWN)
++        return MF_E_SHUTDOWN;
++
++    sac_stop_thread(source);
++
++    EnterCriticalSection(&source->cs);
++    if (source->state != SAC_STATE_SHUTDOWN)
++    {
++        source->state = SAC_STATE_STOPPED;
++        sac_flush(source);
++        IMFMediaEventQueue_QueueEventParamVar(source->event_queue, MESourceStopped, &GUID_NULL, S_OK, NULL);
++        IMFMediaEventQueue_QueueEventParamVar(source->stream_event_queue, MEStreamStopped, &GUID_NULL, S_OK, NULL);
++    }
++    LeaveCriticalSection(&source->cs);
++
++    return S_OK;
++}
++
++static HRESULT WINAPI sac_source_Pause(IMFMediaSource *iface)
++{
++    struct audio_capture_source *source = impl_from_IMFMediaSource(iface);
++    HRESULT hr = S_OK;
++
++    TRACE("%p.\n", iface);
++
++    EnterCriticalSection(&source->cs);
++    if (source->state == SAC_STATE_SHUTDOWN)
++        hr = MF_E_SHUTDOWN;
++    else if (source->state != SAC_STATE_RUNNING)
++        hr = MF_E_INVALID_STATE_TRANSITION;
++    else
++    {
++        source->state = SAC_STATE_PAUSED;
++        IMFMediaEventQueue_QueueEventParamVar(source->event_queue, MESourcePaused, &GUID_NULL, S_OK, NULL);
++        IMFMediaEventQueue_QueueEventParamVar(source->stream_event_queue, MEStreamPaused, &GUID_NULL, S_OK, NULL);
++    }
++    LeaveCriticalSection(&source->cs);
++
++    return hr;
++}
++
++static HRESULT WINAPI sac_source_Shutdown(IMFMediaSource *iface)
++{
++    struct audio_capture_source *source = impl_from_IMFMediaSource(iface);
++
++    TRACE("%p.\n", iface);
++
++    if (source->state == SAC_STATE_SHUTDOWN)
++        return MF_E_SHUTDOWN;
++
++    sac_stop_thread(source);
++
++    EnterCriticalSection(&source->cs);
++    source->state = SAC_STATE_SHUTDOWN;
++    sac_flush(source);
++    IMFMediaEventQueue_Shutdown(source->event_queue);
++    IMFMediaEventQueue_Shutdown(source->stream_event_queue);
++    LeaveCriticalSection(&source->cs);
++
++    return S_OK;
++}
++
++static const IMFMediaSourceVtbl sac_source_vtbl =
++{
++    sac_source_QueryInterface,
++    sac_source_AddRef,
++    sac_source_Release,
++    sac_source_GetEvent,
++    sac_source_BeginGetEvent,
++    sac_source_EndGetEvent,
++    sac_source_QueueEvent,
++    sac_source_GetCharacteristics,
++    sac_source_CreatePresentationDescriptor,
++    sac_source_Start,
++    sac_source_Stop,
++    sac_source_Pause,
++    sac_source_Shutdown,
++};
++
++static HRESULT sac_create_type(WORD tag, WORD channels, DWORD rate, IMFMediaType **type)
++{
++    WAVEFORMATEX format = {0};
++    HRESULT hr;
++
++    format.wFormatTag = tag;
++    format.nChannels = channels;
++    format.nSamplesPerSec = rate;
++    format.wBitsPerSample = tag == WAVE_FORMAT_IEEE_FLOAT ? 32 : 16;
++    format.nBlockAlign = channels * format.wBitsPerSample / 8;
++    format.nAvgBytesPerSec = rate * format.nBlockAlign;
++
++    if (FAILED(hr = MFCreateMediaType(type)))
++        return hr;
++    if (FAILED(hr = MFInitMediaTypeFromWaveFormatEx(*type, &format, sizeof(format))))
++    {
++        IMFMediaType_Release(*type);
++        *type = NULL;
++    }
++    return hr;
++}
++
++HRESULT create_audio_capture_source(IMFAttributes *attributes, IMFMediaSource **out)
++{
++    static const DWORD common_rates[] = {48000, 44100, 32000, 16000, 8000};
++    static const WORD tags[] = {WAVE_FORMAT_PCM, WAVE_FORMAT_IEEE_FLOAT};
++    IMFMediaType *types[SAC_MAX_TYPES] = {0};
++    struct audio_capture_source *source;
++    DWORD rates[ARRAY_SIZE(common_rates) + 1];
++    unsigned int i, r, c, t, rate_count = 0, type_count = 0;
++    IMFMediaTypeHandler *handler;
++    WAVEFORMATEX *mix = NULL;
++    IAudioClient *client;
++    IMMDevice *device;
++    HRESULT hr, coinit;
++    WORD channels[2];
++    UINT32 length;
++    UINT32 role;
++
++    *out = NULL;
++
++    if (!(source = calloc(1, sizeof(*source))))
++        return E_OUTOFMEMORY;
++
++    source->IMFMediaSource_iface.lpVtbl = &sac_source_vtbl;
++    source->IMFMediaStream_iface.lpVtbl = &sac_stream_vtbl;
++    source->refcount = 1;
++    source->role = eCommunications;
++    list_init(&source->samples);
++    list_init(&source->requests);
++    InitializeCriticalSection(&source->cs);
++
++    if (attributes)
++    {
++        if (SUCCEEDED(IMFAttributes_GetUINT32(attributes, &MF_DEVSOURCE_ATTRIBUTE_SOURCE_TYPE_AUDCAP_ROLE, &role)))
++            source->role = role;
++        if (SUCCEEDED(IMFAttributes_GetStringLength(attributes, &MF_DEVSOURCE_ATTRIBUTE_SOURCE_TYPE_AUDCAP_ENDPOINT_ID,
++                &length)) && (source->endpoint_id = calloc(length + 1, sizeof(WCHAR))))
++        {
++            if (FAILED(IMFAttributes_GetString(attributes, &MF_DEVSOURCE_ATTRIBUTE_SOURCE_TYPE_AUDCAP_ENDPOINT_ID,
++                    source->endpoint_id, length + 1, NULL)))
++            {
++                free(source->endpoint_id);
++                source->endpoint_id = NULL;
++            }
++        }
++    }
++
++    TRACE("endpoint %s, role %d.\n", debugstr_w(source->endpoint_id), source->role);
++
++    /* Query the device mix format to build the list of native types. */
++    coinit = CoInitializeEx(NULL, COINIT_MULTITHREADED);
++    if (SUCCEEDED(hr = sac_open_device(source->endpoint_id, source->role, &device)))
++    {
++        if (SUCCEEDED(hr = IMMDevice_Activate(device, &sac_IID_IAudioClient, CLSCTX_INPROC_SERVER, NULL,
++                (void **)&client)))
++        {
++            hr = IAudioClient_GetMixFormat(client, &mix);
++            IAudioClient_Release(client);
++        }
++        IMMDevice_Release(device);
++    }
++    if (SUCCEEDED(coinit))
++        CoUninitialize();
++    if (FAILED(hr))
++    {
++        WARN("Failed to query capture device, hr %#lx.\n", hr);
++        goto failed;
++    }
++
++    channels[0] = mix->nChannels >= 2 ? 2 : 1;
++    channels[1] = channels[0] == 2 ? 1 : 2;
++    rates[rate_count++] = mix->nSamplesPerSec;
++    for (i = 0; i < ARRAY_SIZE(common_rates); ++i)
++        if (common_rates[i] != mix->nSamplesPerSec)
++            rates[rate_count++] = common_rates[i];
++    CoTaskMemFree(mix);
++
++    for (r = 0; r < rate_count; ++r)
++        for (c = 0; c < ARRAY_SIZE(channels); ++c)
++            for (t = 0; t < ARRAY_SIZE(tags); ++t)
++            {
++                if (type_count >= SAC_MAX_TYPES)
++                    break;
++                if (FAILED(hr = sac_create_type(tags[t], channels[c], rates[r], &types[type_count])))
++                    goto failed;
++                ++type_count;
++            }
++
++    if (FAILED(hr = MFCreateStreamDescriptor(0, type_count, types, &source->sd)))
++        goto failed;
++    if (SUCCEEDED(IMFStreamDescriptor_GetMediaTypeHandler(source->sd, &handler)))
++    {
++        IMFMediaTypeHandler_SetCurrentMediaType(handler, types[0]);
++        IMFMediaTypeHandler_Release(handler);
++    }
++    if (FAILED(hr = MFCreatePresentationDescriptor(1, &source->sd, &source->pd)))
++        goto failed;
++    IMFPresentationDescriptor_SelectStream(source->pd, 0);
++
++    if (FAILED(hr = MFCreateEventQueue(&source->event_queue)))
++        goto failed;
++    if (FAILED(hr = MFCreateEventQueue(&source->stream_event_queue)))
++        goto failed;
++
++    if (!(source->stop_event = CreateEventW(NULL, TRUE, FALSE, NULL))
++            || !(source->ready_event = CreateEventW(NULL, TRUE, FALSE, NULL)))
++    {
++        hr = E_OUTOFMEMORY;
++        goto failed;
++    }
++
++    for (i = 0; i < type_count; ++i)
++        IMFMediaType_Release(types[i]);
++
++    TRACE("Created audio capture source %p with %u native types.\n", source, type_count);
++    *out = &source->IMFMediaSource_iface;
++    return S_OK;
++
++failed:
++    for (i = 0; i < type_count; ++i)
++        if (types[i])
++            IMFMediaType_Release(types[i]);
++    sac_source_destroy(source);
++    return hr;
++}
++
+ static HRESULT audio_capture_create_object(IMFAttributes *attributes, void *user_context, IUnknown **obj)
+ {
+-    FIXME("%p, %p, %p stub.\n", attributes, user_context, obj);
++    TRACE("%p, %p, %p.\n", attributes, user_context, obj);
+ 
+-    return E_NOTIMPL;
++    return create_audio_capture_source(attributes, (IMFMediaSource **)obj);
+ }
+ 
+ static void audio_capture_shutdown_object(void *user_context, IUnknown *obj)
+--- a/dlls/mf/main.c	2026-10-30 13:52:31.000000000 -0700
++++ b/dlls/mf/main.c	2026-11-12 07:04:18.013101419 -0800
+@@ -963,10 +963,26 @@
+  */
+ HRESULT WINAPI MFCreateDeviceSource(IMFAttributes *attributes, IMFMediaSource **source)
+ {
+-    FIXME("%p %p: stub!\n", attributes, source);
++    GUID source_type;
++    HRESULT hr;
++
++    TRACE("%p, %p.\n", attributes, source);
+ 
+     if (!attributes || !source) return E_INVALIDARG;
+     *source = NULL;
++
++    if (FAILED(hr = IMFAttributes_GetGUID(attributes, &MF_DEVSOURCE_ATTRIBUTE_SOURCE_TYPE, &source_type)))
++        return hr;
++
++    if (IsEqualGUID(&source_type, &MF_DEVSOURCE_ATTRIBUTE_SOURCE_TYPE_AUDCAP_GUID))
++    {
++        hr = create_audio_capture_source(attributes, source);
++        if (FAILED(hr))
++            ERR("Failed to create audio capture source, hr %#lx.\n", hr);
++        return hr;
++    }
++
++    FIXME("Not implemented for source type %s.\n", debugstr_guid(&source_type));
+     return E_NOTIMPL;
+ }
+ 
+--- a/dlls/mf/mf_private.h	2026-10-30 13:52:31.000000000 -0700
++++ b/dlls/mf/mf_private.h	2026-11-12 07:04:18.012910560 -0800
+@@ -131,3 +131,4 @@
+ extern HRESULT stream_sink_get_device_manager(IMFStreamSink *stream_sink, IUnknown **device_manager);
+ 
+ extern HRESULT enum_audio_capture_sources(IMFAttributes *attributes, IMFActivate ***sources, UINT32 *ret_count);
++extern HRESULT create_audio_capture_source(IMFAttributes *attributes, IMFMediaSource **source);

@@ -1,0 +1,125 @@
+NULL-guard patch
+block 0x140669a32 -> cave 0x140158082 (jmp), resume 0x140669a4c
+cave: 488b8424980000004885c0750db8054000804881c418020000c3488b00488b8088000000488984244801000000e998195100
+
+--- ROOT CAUSE of the chat-log crash (Ghidra 12.1, Nov 12) ---
+FUN_1406696b0(msg, text) renders one chat line into the IE log pane:
+  1. QI(msg) for IID_IMarkupServices {3050F4A0-98B5-11CF-BB82-00AA00BDCE0B}
+     -> vtable+0x18 = CreateMarkupPointer(&ptr); then ptr->vtable[0x58]
+  2. QI(msg) for IID_IDisplayServices {3050F69D-98B5-11CF-BB82-00AA00BDCE0B}
+     -> vtable+0x18 = CreateDisplayPointer(&ptr)
+Wine's mshtml implements both as stubs (fixme:mshtml:DisplayServices_CreateDisplayPointer)
+that return without writing the out-pointer, so the app dereferences NULL -> crash.
+The 0x140669a32 E_FAIL guard prevents the crash but also aborts the redraw,
+which is why the log stays blank after put_innerHTML "" clears it.
+Sending is separately blocked: Enter is eaten by
+DocObjOleInPlaceActiveObject_TranslateAccelerator (returns E_NOTIMPL in Wine).
+Conclusion: room text chat cannot work on Wine without real markup/display services.
+Callers: FUN_14066a350, FUN_140669de0.
+
+=== CHAT TEXT NOW WORKS (Nov 12) ===
+Root chain: app renders chat lines from its own C++ via MSHTML markup pointers AND
+page-side JS (camfrog://wb-log-im-data.inside) whose insertHtmlBeforeMessage(msg_id, html)
+needs an existing anchor element.  Wine had four gaps; all are fixed:
+
+1. Self-built mshtml (Wine 11.21, /tmp/wine-wine-11.21) refused to load as "native"
+   because the PE contains the "Wine builtin DLL" signature at file offset 0x40.
+   Patch: overwrite those 16 bytes (e.g. "Camfrog native!\0").  Without this, the
+   prefix copy silently failed to load ("couldn't load in-process dll") and typing died.
+2. range.c: MarkupPointer was an empty shell (malloc, no init) - every IMarkupPointer2
+   method returned E_NOTIMPL, and Release dereferenced garbage.
+   Patch: added doc/range fields, zero-init in create_markup_pointer, Release frees the
+   range, and MoveAdjacentToElement now positions a real nsIDOMRange at the element
+   boundary (BeforeBegin/AfterBegin/BeforeEnd/AfterEnd).
+3. htmlstylesheet.c: HTMLStyleSheet4_get_ownerNode returned E_NOTIMPL, so the page JS
+   threw 800a01b6 on document.styleSheets[1].ownerNode and aborted initialisation.
+   Patch: implement it via nsIDOMStyleSheet::GetOwnerNode + get_node() -> IHTMLElement.
+4. App exe page JS: insertHtmlBeforeMessage() returned early when the anchor id was
+   absent, so an empty #log never received its first message.  Patched (same-length,
+   194-byte slot) to fall back to appending into #log:
+   function insertHtmlBeforeMessage(a,b){var m=document.getElementById(a);if(!m){m=document.getElementById('log');if(!m)return;}m.insertAdjacentHTML(m.id=='log'?'beforeend':'beforebegin',b)}
+
+Install state: ~/.local/share/wineprefixes/camfrog8/drive_c/windows/system32/mshtml.dll
+= patched build (also saved here as mshtml-patched.dll).
+Registry: HKCU\Software\Wine\DllOverrides  mshtml = native  (persistent, no env var needed).
+Rebuild: cd /tmp/wine-wine-11.21 && make -j8 dlls/mshtml/all, strip signature byte 0x40,
+copy to system32.
+Known quirk: Enter sends only after a Backspace keystroke (Wine's
+TranslateAccelerator returns E_NOTIMPL, so the app never sees the keypress until the
+input state is refreshed by another key).
+
+=== OUTGOING AUDIO (TALK) NOW WORKS (Nov 12) ===
+Symptom: incoming room audio fine, but Talk / hands-free sent nothing; no capture stream ever opened.
+Root cause: Camfrog opens the microphone through Media Foundation:
+  MFCreateDeviceSource(AUDCAP, endpoint id) -> MFCreateSourceReaderFromMediaSource -> ReadSample loop.
+Wine 11.21's mf.dll has MFCreateDeviceSource as a stub (fixme:mfplat:MFCreateDeviceSource ... stub!)
+and sac.c's audio_capture_create_object is a stub too, so the app got E_NOTIMPL at every room join
+and silently ran with no capture pipeline.  (Not a device problem: WASAPI enumerates CamMic fine.)
+Fix: dlls/mf/sac.c now implements a live audio-capture IMFMediaSource + IMFMediaStream backed by a
+WASAPI shared-mode capture client (AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM, needed because this mmdevapi
+rejects non-mix rate/channels otherwise).  20 native PCM16/float types (mix rate + 48k/44.1k/32k/16k/8k,
+mono+stereo); Camfrog picks 48000 Hz mono PCM16.  MFCreateDeviceSource (main.c) and the
+MFEnumDeviceSources activation objects both route to create_audio_capture_source().
+Patch saved: camfrog/mf-audio-capture.patch (apply in the wine-11.21 tree with patch -p1).
+Rebuild: cd /tmp/wine-wine-11.21 && make -j16 dlls/mf/all
+Install: overwrite 16 bytes at file offset 0x40 of dlls/mf/x86_64-windows/mf.dll (as for mshtml),
+copy to system32/mf.dll (original fake dll kept as system32/mf.dll.wine-orig; patched copy saved
+here as mf-patched.dll).  Registry: HKCU\Software\Wine\DllOverrides  mf = native.
+Verified: PipeWire shows "Camfrog Video Chat" recording s16le 1ch 48000Hz from cammic, the in-app
+meter moves, and holding Talk sends 3-12 KB per 2 s to the room server (silent otherwise).
+Not verified by a second listener yet.
+Debug: WINEDEBUG=trace+mfplat shows sac_* calls (very chatty: ~0.7 MB/s of log while in a room).
+
+=== LIVE ROOM CHAT LOG, MOTD AGREEMENT PAGE, ENTER KEY (Nov 12, later) ===
+All three were missing pieces of Wine's mshtml that Camfrog's native code calls directly.
+
+--- Live feed did not update until rejoin; MOTD/agreement pane blank ---
+History is inserted by page JS (insertHtmlBeforeMessage -> insertAdjacentHTML), which is why a
+rejoin showed everything.  A LIVE message takes a different native path, and each step hit a stub:
+  1. IMarkupPointer::Left() - the app parks a pointer at BeforeEnd of #log and asks what is to
+     the left (the last message).  Stub returned E_NOTIMPL.
+     Fix (range.c): markup_pointer_look() implements Left/Right over the nsIDOMRange position:
+     Text / EnterScope / ExitScope / NoScope contexts, optional move, element out-param.
+     Whitespace-only text nodes are skipped (IE's parser drops them, Gecko keeps them).
+  2. IHTMLElement2::doScroll("scrollbarPageDown") - called after scrollIntoView(last message)
+     to reach the real bottom.  Stub was a no-op, leaving the view 12px short (the padding under
+     the last message), so the app decided "not at bottom" and called showScrollDownButton()
+     instead of rendering the message.
+     Fix (htmlelem.c): doScroll implemented for the scrollbar*/page*/up/down/left/right components.
+  3. IHTMLElement2::get_canHandleChildren(body) - checked right before the insert.  Stub
+     returned E_NOTIMPL and the insert was skipped.
+     Fix (htmlelem.c): VARIANT_TRUE except for void elements.
+With all three, a send does: insert pending line (msgid_-N) -> server ack -> removeMessage ->
+insert real message -> scroll.  The MOTD pane ("You agreed. You are now logged in.", links
+camfrog:motd:yes:<room> / camfrog:motd:no:<room>) is the same kind of page and started rendering
+with the same fixes; no separate change was needed.
+
+--- Enter only sent after a Backspace ---
+The Enter key-down never reaches the browser: Camfrog intercepts it in its own message loop and
+only sends if it believes the box has text.  It learns about typed text through an edit designer
+(IHTMLEditServices::AddDesigner -> IHTMLEditDesigner::PostHandleEvent), because its keypress
+handler runs BEFORE the character is inserted.  AddDesigner was a stub, so that never happened.
+Backspace "worked" because the app has a separate native refresh for keys that produce no
+keypress in IE.  TranslateAccelerator is not involved (the app's hostui hook returns E_NOTIMPL
+for every key), so the earlier accelerator theory in this file was wrong.
+Fix (service.c, nsevents.c): AddDesigner/RemoveDesigner keep a designer list; for
+keydown/keypress/keyup, PreHandleEvent is called after normal dispatch (S_OK = preventDefault),
+and PostHandleEvent + PostEditorEventNotify run from a posted task, i.e. after Gecko has
+performed the default action.
+
+--- Also changed ---
+oleobj.c: DocObj TranslateAccelerator has a per-thread re-entrancy guard and traces msg/wparam.
+
+--- Still open ---
+* Intermittent startup hang: "err:virtual:virtual_setup_exception stack overflow" on the UI
+  thread (0024) about 15-20 s after launch, seen 3 times in ~14 launches on Nov 12 (two of them
+  on the 02:16 mshtml build, so not caused by the later changes).  The one traced occurrence was
+  in the middle of Gecko cycle collection.  Cause unknown.  camfrog/cfrun.py launches Camfrog and
+  dumps the dead thread's stack (return-address histogram) to <log>.stack.txt when it happens.
+* Camfrog's record-volume slider is not applied by the new mf.dll capture source.
+* ieframe still contains debug code from an earlier experiment (persist.c/webbrowser.c write
+  /tmp/iefstream-NN.bin and /tmp/ief-wb.log); the streams turned out to be binary control state,
+  not HTML, so the pending_html idea there is probably unnecessary.
+
+Patches: camfrog/wine-mshtml-ieframe.patch (mshtml + ieframe), camfrog/mf-audio-capture.patch.
+Built copies: mshtml-patched.dll, mf-patched.dll, camfrog/ieframe-patched.dll.

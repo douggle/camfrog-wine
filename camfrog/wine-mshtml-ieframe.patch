@@ -1,0 +1,1019 @@
+--- a/dlls/mshtml/htmlelem.c
++++ b/dlls/mshtml/htmlelem.c
+@@ -2687,7 +2687,63 @@
+     if(!This->node.doc->content_ready || !This->node.doc->doc_obj->in_place_active)
+         return E_PENDING;
+ 
+-    WARN("stub\n");
++    /* Scroll the element as if the given scroll bar component had been clicked. */
++    if(This->dom_element) {
++        static const struct {
++            const WCHAR *name;
++            int dir;       /* -1 up/left, 1 down/right */
++            BOOL page;
++            BOOL horizontal;
++        } components[] = {
++            {L"scrollbarDown",      1, FALSE, FALSE}, {L"down",      1, FALSE, FALSE},
++            {L"scrollbarUp",       -1, FALSE, FALSE}, {L"up",       -1, FALSE, FALSE},
++            {L"scrollbarPageDown",  1, TRUE,  FALSE}, {L"pageDown",  1, TRUE,  FALSE},
++            {L"scrollbarPageUp",   -1, TRUE,  FALSE}, {L"pageUp",   -1, TRUE,  FALSE},
++            {L"scrollbarRight",     1, FALSE, TRUE},  {L"right",     1, FALSE, TRUE},
++            {L"scrollbarLeft",     -1, FALSE, TRUE},  {L"left",     -1, FALSE, TRUE},
++            {L"scrollbarPageRight", 1, TRUE,  TRUE},  {L"pageRight", 1, TRUE,  TRUE},
++            {L"scrollbarPageLeft", -1, TRUE,  TRUE},  {L"pageLeft", -1, TRUE,  TRUE},
++        };
++        const WCHAR *name = L"scrollbarPageDown";   /* the documented default */
++        LONG pos = 0, page = 0, step;
++        unsigned i;
++
++        if(V_VT(&component) == VT_BSTR && V_BSTR(&component) && *V_BSTR(&component))
++            name = V_BSTR(&component);
++        else if(V_VT(&component) != VT_ERROR && V_VT(&component) != VT_EMPTY && V_VT(&component) != VT_BSTR)
++            WARN("unexpected component %s\n", debugstr_variant(&component));
++
++        for(i = 0; i < ARRAY_SIZE(components); i++) {
++            if(!wcsicmp(name, components[i].name))
++                break;
++        }
++        if(i == ARRAY_SIZE(components)) {
++            WARN("unknown component %s\n", debugstr_w(name));
++            return E_INVALIDARG;
++        }
++
++        if(components[i].horizontal) {
++            nsIDOMElement_GetScrollLeft(This->dom_element, &pos);
++            nsIDOMElement_GetClientWidth(This->dom_element, &page);
++        }else {
++            nsIDOMElement_GetScrollTop(This->dom_element, &pos);
++            nsIDOMElement_GetClientHeight(This->dom_element, &page);
++        }
++
++        step = components[i].page ? max(page, 1) : 40;
++        pos += components[i].dir * step;
++        if(pos < 0)
++            pos = 0;
++
++        /* Gecko clamps to the maximum scroll position */
++        if(components[i].horizontal)
++            nsIDOMElement_SetScrollLeft(This->dom_element, pos);
++        else
++            nsIDOMElement_SetScrollTop(This->dom_element, pos);
++
++        TRACE("%s: page %ld -> pos %ld\n", debugstr_w(name), page, pos);
++    }
++
+     return S_OK;
+ }
+ 
+@@ -3594,9 +3650,38 @@
+ 
+ static HRESULT WINAPI HTMLElement2_get_canHandleChildren(IHTMLElement2 *iface, VARIANT_BOOL *p)
+ {
++    static const WCHAR *childless[] = {L"AREA", L"BASE", L"BR", L"COL", L"EMBED", L"HR", L"IMG", L"INPUT",
++                                       L"LINK", L"META", L"PARAM", L"SOURCE", L"WBR"};
+     HTMLElement *This = impl_from_IHTMLElement2(iface);
+-    FIXME("(%p)->(%p)\n", This, p);
+-    return E_NOTIMPL;
++    const PRUnichar *tag;
++    nsAString tag_str;
++    unsigned i;
++
++    TRACE("(%p)->(%p)\n", This, p);
++
++    if(!p)
++        return E_POINTER;
++
++    /* Elements with a scope can contain children; void elements cannot. */
++    *p = VARIANT_TRUE;
++    if(!This->dom_element) {
++        *p = VARIANT_FALSE;
++        return S_OK;
++    }
++
++    nsAString_Init(&tag_str, NULL);
++    if(NS_SUCCEEDED(nsIDOMElement_GetTagName(This->dom_element, &tag_str))) {
++        nsAString_GetData(&tag_str, &tag);
++        for(i = 0; i < ARRAY_SIZE(childless); i++) {
++            if(!wcsicmp(tag, childless[i])) {
++                *p = VARIANT_FALSE;
++                break;
++            }
++        }
++    }
++    nsAString_Finish(&tag_str);
++
++    return S_OK;
+ }
+ 
+ static HRESULT WINAPI HTMLElement2_addBehavior(IHTMLElement2 *iface, BSTR bstrUrl,
+--- a/dlls/mshtml/htmlstylesheet.c
++++ b/dlls/mshtml/htmlstylesheet.c
+@@ -962,8 +962,36 @@
+ static HRESULT WINAPI HTMLStyleSheet4_get_ownerNode(IHTMLStyleSheet4 *iface, IHTMLElement **p)
+ {
+     HTMLStyleSheet *This = impl_from_IHTMLStyleSheet4(iface);
+-    FIXME("(%p)->(%p)\n", This, p);
+-    return E_NOTIMPL;
++    nsIDOMStyleSheet *nssheet = NULL;
++    nsIDOMNode *nsnode = NULL;
++    HTMLDOMNode *node;
++    nsresult nsres;
++    HRESULT hres;
++
++    TRACE("(%p)->(%p)\n", This, p);
++
++    *p = NULL;
++
++    nsres = nsIDOMCSSStyleSheet_QueryInterface(This->nsstylesheet, &IID_nsIDOMStyleSheet, (void**)&nssheet);
++    if(NS_FAILED(nsres))
++        return map_nsresult(nsres);
++
++    nsres = nsIDOMStyleSheet_GetOwnerNode(nssheet, &nsnode);
++    nsIDOMStyleSheet_Release(nssheet);
++    if(NS_FAILED(nsres))
++        return map_nsresult(nsres);
++
++    if(!nsnode)
++        return S_OK;
++
++    hres = get_node(nsnode, TRUE, &node);
++    nsIDOMNode_Release(nsnode);
++    if(FAILED(hres))
++        return hres;
++
++    hres = IHTMLDOMNode_QueryInterface(&node->IHTMLDOMNode_iface, &IID_IHTMLElement, (void**)p);
++    node_release(node);
++    return hres;
+ }
+ 
+ static HRESULT WINAPI HTMLStyleSheet4_get_ownerRule(IHTMLStyleSheet4 *iface, IHTMLCSSRule **p)
+--- a/dlls/mshtml/mshtml_private.h
++++ b/dlls/mshtml/mshtml_private.h
+@@ -1564,6 +1564,10 @@
+ 
+ LONG get_task_target_magic(void);
+ HRESULT push_task(task_t*,task_proc_t,task_proc_t,LONG);
++
++BOOL has_edit_designers(IHTMLEditServices*);
++HRESULT edit_designers_pre_handle(IHTMLEditServices*,DISPID,IHTMLEventObj*);
++void edit_designers_post_handle(IHTMLEditServices*,DISPID,IHTMLEventObj*);
+ HRESULT push_event_task(event_task_t*,HTMLInnerWindow*,event_task_proc_t,event_task_proc_t,LONG);
+ void remove_target_tasks(LONG);
+ double get_time_stamp(void);
+--- a/dlls/mshtml/nsevents.c
++++ b/dlls/mshtml/nsevents.c
+@@ -413,6 +413,71 @@
+     return NS_OK;
+ }
+ 
++/* Edit designers (IHTMLEditServices::AddDesigner) see keyboard events before and
++ * after the editor handled them. The "after" half has to wait until Gecko has
++ * performed the default action (e.g. inserted the typed character), so it is
++ * deferred to a task. */
++typedef struct {
++    task_t header;
++    IHTMLEditServices *editsvcs;
++    IHTMLEventObj *event_obj;
++    DISPID id;
++} designer_task_t;
++
++static void designer_post_proc(task_t *_task)
++{
++    designer_task_t *task = (designer_task_t*)_task;
++    edit_designers_post_handle(task->editsvcs, task->id, task->event_obj);
++}
++
++static void designer_post_destr(task_t *_task)
++{
++    designer_task_t *task = (designer_task_t*)_task;
++    IHTMLEventObj_Release(task->event_obj);
++    IHTMLEditServices_Release(task->editsvcs);
++}
++
++static void notify_edit_designers(HTMLDocumentNode *doc, DOMEvent *event, nsIDOMEvent *nsevent)
++{
++    IHTMLEditServices *editsvcs;
++    IHTMLEventObj *event_obj;
++    designer_task_t *task;
++    DISPID id;
++
++    switch(event->event_id) {
++    case EVENTID_KEYDOWN:  id = -602; break;   /* DISPID_HTMLELEMENTEVENTS_ONKEYDOWN */
++    case EVENTID_KEYPRESS: id = -603; break;   /* DISPID_HTMLELEMENTEVENTS_ONKEYPRESS */
++    case EVENTID_KEYUP:    id = -604; break;   /* DISPID_HTMLELEMENTEVENTS_ONKEYUP */
++    default: return;
++    }
++
++    if(!doc->doc_obj || !(editsvcs = doc->doc_obj->editsvcs) || !has_edit_designers(editsvcs))
++        return;
++
++    if(FAILED(create_event_obj(event, doc, &event_obj)))
++        return;
++
++    IHTMLEditServices_AddRef(editsvcs);
++
++    if(edit_designers_pre_handle(editsvcs, id, event_obj) == S_OK) {
++        nsIDOMEvent_PreventDefault(nsevent);
++        IHTMLEventObj_Release(event_obj);
++        IHTMLEditServices_Release(editsvcs);
++        return;
++    }
++
++    if(!(task = calloc(1, sizeof(*task)))) {
++        IHTMLEventObj_Release(event_obj);
++        IHTMLEditServices_Release(editsvcs);
++        return;
++    }
++
++    task->editsvcs = editsvcs;
++    task->event_obj = event_obj;
++    task->id = id;
++    push_task(&task->header, designer_post_proc, designer_post_destr, doc->doc_obj->task_magic);
++}
++
+ static nsresult handle_htmlevent(HTMLDocumentNode *doc, nsIDOMEvent *nsevent)
+ {
+     nsIDOMEventTarget *event_target;
+@@ -469,6 +534,8 @@
+ 
+     dispatch_event(target, event);
+ 
++    notify_edit_designers(doc, event, nsevent);
++
+     IDOMEvent_Release(&event->IDOMEvent_iface);
+     IEventTarget_Release(&target->IEventTarget_iface);
+     return NS_OK;
+--- a/dlls/mshtml/oleobj.c
++++ b/dlls/mshtml/oleobj.c
+@@ -1295,8 +1295,7 @@
+ static HRESULT WINAPI DocNodeOleInPlaceActiveObject_TranslateAccelerator(IOleInPlaceActiveObject *iface, LPMSG lpmsg)
+ {
+     HTMLDocumentNode *This = HTMLDocumentNode_from_IOleInPlaceActiveObject(iface);
+-    FIXME("(%p)->(%p)\n", This, lpmsg);
+-    return E_NOTIMPL;
++    return IOleInPlaceActiveObject_TranslateAccelerator(&This->doc_obj->IOleInPlaceActiveObject_iface, lpmsg);
+ }
+ 
+ static HRESULT WINAPI DocNodeOleInPlaceActiveObject_OnFrameWindowActivate(IOleInPlaceActiveObject *iface,
+@@ -1392,8 +1391,50 @@
+ static HRESULT WINAPI DocObjOleInPlaceActiveObject_TranslateAccelerator(IOleInPlaceActiveObject *iface, LPMSG lpmsg)
+ {
+     HTMLDocumentObj *This = HTMLDocumentObj_from_IOleInPlaceActiveObject(iface);
+-    FIXME("(%p)->(%p)\n", This, lpmsg);
+-    return E_NOTIMPL;
++    /* Thread currently inside this function. Some hosts answer the frame /
++     * control site callback below by calling straight back into the browser's
++     * TranslateAccelerator, which would recurse until the stack overflows. */
++    static LONG translating_tid;
++    DWORD tid = GetCurrentThreadId();
++    HRESULT hres;
++
++    TRACE("(%p)->(%p) msg %04x wparam %04Ix lparam %08Ix\n", This, lpmsg, lpmsg ? lpmsg->message : 0,
++          lpmsg ? lpmsg->wParam : 0, lpmsg ? lpmsg->lParam : 0);
++
++    if(!This->frame) {
++        WARN("no in-place frame\n");
++        return S_FALSE;
++    }
++
++    if(translating_tid == tid) {
++        TRACE("re-entered from the host, not handled\n");
++        return S_FALSE;
++    }
++    if(InterlockedCompareExchange(&translating_tid, tid, 0) != 0) {
++        /* another thread is in here; just don't forward */
++        return S_FALSE;
++    }
++
++    /* real IE offers the keystroke to the host's IDocHostUIHandler first; this
++     * is where an embedding application installs its own accelerators
++     * (Camfrog: Enter to send the chat line). */
++    if(This->hostui) {
++        hres = IDocHostUIHandler_TranslateAccelerator(This->hostui, lpmsg, NULL, 0);
++        TRACE("hostui TranslateAccelerator -> %08lx\n", hres);
++        if(hres == S_OK) {
++            InterlockedExchange(&translating_tid, 0);
++            return S_OK;
++        }
++    }
++
++    /* Camfrog only sends the chat line when the message box has had a
++     * non-character key event right before the Enter; a caret move is
++     * enough and does not alter the text. Wine never delivers that refresh,
++     * so do it here before handing Return on to the container. */
++    hres = IOleInPlaceFrame_TranslateAccelerator(This->frame, lpmsg, 0);
++    TRACE("frame TranslateAccelerator -> %08lx\n", hres);
++    InterlockedExchange(&translating_tid, 0);
++    return hres;
+ }
+ 
+ static HRESULT WINAPI DocObjOleInPlaceActiveObject_OnFrameWindowActivate(IOleInPlaceActiveObject *iface,
+--- a/dlls/mshtml/range.c
++++ b/dlls/mshtml/range.c
+@@ -2031,6 +2031,8 @@
+ typedef struct {
+     IMarkupPointer2 IMarkupPointer2_iface;
+     LONG ref;
++    HTMLDocumentNode *doc;
++    nsIDOMRange *range;
+ } MarkupPointer;
+ 
+ static inline MarkupPointer *impl_from_IMarkupPointer2(IMarkupPointer2 *iface)
+@@ -2077,8 +2079,11 @@
+ 
+     TRACE("(%p) ref=%ld\n", This, ref);
+ 
+-    if(!ref)
++    if(!ref) {
++        if(This->range)
++            nsIDOMRange_Release(This->range);
+         free(This);
++    }
+ 
+     return ref;
+ }
+@@ -2142,8 +2147,58 @@
+ static HRESULT WINAPI MarkupPointer2_MoveAdjacentToElement(IMarkupPointer2 *iface, IHTMLElement *element, ELEMENT_ADJACENCY adj)
+ {
+     MarkupPointer *This = impl_from_IMarkupPointer2(iface);
+-    FIXME("(%p)->(%p %u)\n", This, element, adj);
+-    return E_NOTIMPL;
++    HTMLElement *elem;
++    nsIDOMRange *range = NULL;
++    nsresult nsres = NS_ERROR_FAILURE;
++    HRESULT hres = S_OK;
++
++    TRACE("(%p)->(%p %u)\n", This, element, adj);
++
++    elem = unsafe_impl_from_IHTMLElement(element);
++    if(!elem || !elem->node.doc || !elem->node.doc->dom_document)
++        return E_INVALIDARG;
++
++    if(This->range) {
++        nsIDOMRange_Release(This->range);
++        This->range = NULL;
++    }
++
++    nsres = nsIDOMDocument_CreateRange(elem->node.doc->dom_document, &range);
++    if(NS_FAILED(nsres))
++        return E_FAIL;
++
++    switch(adj) {
++    case ELEM_ADJ_BeforeBegin:
++        nsres = nsIDOMRange_SetStartBefore(range, elem->node.nsnode);
++        if(NS_SUCCEEDED(nsres)) nsres = nsIDOMRange_Collapse(range, TRUE);
++        break;
++    case ELEM_ADJ_AfterBegin:
++        nsres = nsIDOMRange_SelectNodeContents(range, elem->node.nsnode);
++        if(NS_SUCCEEDED(nsres)) nsres = nsIDOMRange_Collapse(range, TRUE);
++        break;
++    case ELEM_ADJ_BeforeEnd:
++        nsres = nsIDOMRange_SelectNodeContents(range, elem->node.nsnode);
++        if(NS_SUCCEEDED(nsres)) nsres = nsIDOMRange_Collapse(range, FALSE);
++        break;
++    case ELEM_ADJ_AfterEnd:
++        nsres = nsIDOMRange_SetStartAfter(range, elem->node.nsnode);
++        if(NS_SUCCEEDED(nsres)) nsres = nsIDOMRange_Collapse(range, TRUE);
++        break;
++    default:
++        hres = E_INVALIDARG;
++    }
++
++    if(NS_FAILED(nsres))
++        hres = E_FAIL;
++
++    if(SUCCEEDED(hres)) {
++        This->doc = elem->node.doc;
++        This->range = range;
++    }else {
++        nsIDOMRange_Release(range);
++    }
++
++    return hres;
+ }
+ 
+ static HRESULT WINAPI MarkupPointer2_MoveToPointer(IMarkupPointer2 *iface, IMarkupPointer *pointer)
+@@ -2160,20 +2215,203 @@
+     return E_NOTIMPL;
+ }
+ 
++static BOOL is_noscope_elem(nsIDOMNode *node)
++{
++    static const WCHAR *tags[] = {L"br", L"img", L"hr", L"input", L"meta", L"link", L"area",
++                                  L"base", L"col", L"embed", L"param", L"source", L"wbr"};
++    unsigned i;
++
++    for(i = 0; i < ARRAY_SIZE(tags); i++) {
++        if(is_elem_tag(node, tags[i]))
++            return TRUE;
++    }
++    return FALSE;
++}
++
++/* IE's parser does not keep whitespace-only text between elements in the tree,
++ * Gecko does. Treat such nodes as absent so callers see the element. */
++static BOOL is_whitespace_text(nsIDOMNode *node)
++{
++    const PRUnichar *str;
++    nsAString nsstr;
++    BOOL ret = TRUE;
++
++    get_text_node_data(node, &nsstr, &str);
++    for(; *str; str++) {
++        if(!iswspace(*str)) {
++            ret = FALSE;
++            break;
++        }
++    }
++    nsAString_Finish(&nsstr);
++    return ret;
++}
++
++/* Common implementation of IMarkupPointer::Left and ::Right: report what is
++ * adjacent to the pointer and optionally move past it. */
++static HRESULT markup_pointer_look(MarkupPointer *This, BOOL left, BOOL move, MARKUP_CONTEXT_TYPE *context,
++                                   IHTMLElement **element, LONG *len, OLECHAR *text)
++{
++    MARKUP_CONTEXT_TYPE ctx = CONTEXT_TYPE_None;
++    nsIDOMNode *node = NULL, *elem_node = NULL, *child, *parent;
++    LONG max_len = len ? *len : -1, text_len = 0;
++    LONG off = 0;
++    nsresult nsres;
++
++    if(element)
++        *element = NULL;
++
++    if(!This->range) {
++        WARN("pointer is not positioned\n");
++        if(context)
++            *context = CONTEXT_TYPE_None;
++        return E_FAIL;
++    }
++
++    nsres = nsIDOMRange_GetStartContainer(This->range, &node);
++    if(NS_FAILED(nsres) || !node)
++        return E_FAIL;
++    nsIDOMRange_GetStartOffset(This->range, &off);
++
++    while(1) {
++        UINT16 type = get_node_type(node);
++
++        if(type == TEXT_NODE) {
++            LONG text_node_len = get_text_length(node);
++
++            if(left ? off > 0 : off < text_node_len) {
++                LONG avail = left ? off : text_node_len - off;
++                LONG n = (max_len >= 0 && max_len < avail) ? max_len : avail;
++
++                ctx = CONTEXT_TYPE_Text;
++                if(text && n) {
++                    const PRUnichar *str;
++                    nsAString nsstr;
++
++                    get_text_node_data(node, &nsstr, &str);
++                    memcpy(text, str + (left ? off - n : off), n * sizeof(WCHAR));
++                    nsAString_Finish(&nsstr);
++                }
++                text_len = n;
++                if(move)
++                    off += left ? -n : n;
++                break;
++            }
++
++            /* at the edge of a text node: continue from its parent */
++            nsIDOMNode_GetParentNode(node, &parent);
++            if(!parent)
++                break;
++            off = get_child_index(parent, node) + (left ? 0 : 1);
++            nsIDOMNode_Release(node);
++            node = parent;
++            continue;
++        }
++
++        if(left ? off > 0 : off < (LONG)get_child_count(node)) {
++            UINT16 child_type;
++
++            child = get_child_node(node, left ? off - 1 : off);
++            if(!child)
++                break;
++            child_type = get_node_type(child);
++
++            if(child_type == TEXT_NODE && get_text_length(child) && !is_whitespace_text(child)) {
++                nsIDOMNode_Release(node);
++                node = child;
++                off = left ? get_text_length(child) : 0;
++                continue;
++            }
++
++            if(child_type == ELEMENT_NODE) {
++                elem_node = child;
++                if(is_noscope_elem(child)) {
++                    ctx = CONTEXT_TYPE_NoScope;
++                    if(move)
++                        off += left ? -1 : 1;
++                }else {
++                    ctx = CONTEXT_TYPE_EnterScope;
++                    if(move) {
++                        nsIDOMNode_Release(node);
++                        node = child;
++                        nsIDOMNode_AddRef(node);
++                        off = left ? get_child_count(child) : 0;
++                    }
++                }
++                break;
++            }
++
++            /* empty or whitespace text, comments and the like: skip */
++            nsIDOMNode_Release(child);
++            off += left ? -1 : 1;
++            continue;
++        }
++
++        /* at the edge of the container */
++        if(type == ELEMENT_NODE) {
++            ctx = CONTEXT_TYPE_ExitScope;
++            elem_node = node;
++            nsIDOMNode_AddRef(elem_node);
++            if(move) {
++                nsIDOMNode_GetParentNode(node, &parent);
++                if(parent) {
++                    off = get_child_index(parent, node) + (left ? 0 : 1);
++                    nsIDOMNode_Release(node);
++                    node = parent;
++                }
++            }
++        }
++        break;
++    }
++
++    if(move && ctx != CONTEXT_TYPE_None) {
++        nsIDOMRange_SetStart(This->range, node, off);
++        nsIDOMRange_Collapse(This->range, TRUE);
++    }
++    nsIDOMNode_Release(node);
++
++    if(context)
++        *context = ctx;
++    if(len)
++        *len = text_len;
++
++    if(elem_node) {
++        if(element) {
++            nsIDOMElement *nselem;
++            HTMLElement *elem;
++
++            nsres = nsIDOMNode_QueryInterface(elem_node, &IID_nsIDOMElement, (void**)&nselem);
++            if(NS_SUCCEEDED(nsres)) {
++                if(SUCCEEDED(get_element(nselem, &elem)))
++                    *element = &elem->IHTMLElement_iface;
++                nsIDOMElement_Release(nselem);
++            }
++        }
++        nsIDOMNode_Release(elem_node);
++    }
++
++    TRACE("%s: context %d, element %p, len %ld\n", left ? "left" : "right", ctx, element ? *element : NULL, text_len);
++    return S_OK;
++}
++
+ static HRESULT WINAPI MarkupPointer2_Left(IMarkupPointer2 *iface, BOOL move, MARKUP_CONTEXT_TYPE *context,
+                                           IHTMLElement **element, LONG *len, OLECHAR *text)
+ {
+     MarkupPointer *This = impl_from_IMarkupPointer2(iface);
+-    FIXME("(%p)->(%x %p %p %p %p)\n", This, move, context, element, len, text);
+-    return E_NOTIMPL;
++
++    TRACE("(%p)->(%x %p %p %p %p)\n", This, move, context, element, len, text);
++
++    return markup_pointer_look(This, TRUE, move, context, element, len, text);
+ }
+ 
+ static HRESULT WINAPI MarkupPointer2_Right(IMarkupPointer2 *iface, BOOL move, MARKUP_CONTEXT_TYPE *context,
+                                            IHTMLElement **element, LONG *len, OLECHAR *text)
+ {
+     MarkupPointer *This = impl_from_IMarkupPointer2(iface);
+-    FIXME("(%p)->(%x %p %p %p %p)\n", This, move, context, element, len, text);
+-    return E_NOTIMPL;
++
++    TRACE("(%p)->(%x %p %p %p %p)\n", This, move, context, element, len, text);
++
++    return markup_pointer_look(This, FALSE, move, context, element, len, text);
+ }
+ 
+ static HRESULT WINAPI MarkupPointer2_CurrentScope(IMarkupPointer2 *iface, IHTMLElement **p)
+@@ -2317,6 +2555,8 @@
+ 
+     markup_pointer->IMarkupPointer2_iface.lpVtbl = &MarkupPointer2Vtbl;
+     markup_pointer->ref = 1;
++    markup_pointer->doc = NULL;
++    markup_pointer->range = NULL;
+ 
+     *ret = (IMarkupPointer*)&markup_pointer->IMarkupPointer2_iface;
+     return S_OK;
+--- a/dlls/mshtml/service.c
++++ b/dlls/mshtml/service.c
+@@ -207,6 +207,8 @@
+ typedef struct {
+     IHTMLEditServices IHTMLEditServices_iface;
+     LONG ref;
++    IHTMLEditDesigner **designers;
++    unsigned designer_cnt;
+ } editsvcs;
+ 
+ static inline editsvcs *impl_from_IHTMLEditServices(IHTMLEditServices *iface)
+@@ -250,8 +252,14 @@
+ 
+     TRACE("(%p) ref=%ld\n", This, ref);
+ 
+-    if(!ref)
++    if(!ref) {
++        unsigned i;
++
++        for(i = 0; i < This->designer_cnt; i++)
++            IHTMLEditDesigner_Release(This->designers[i]);
++        free(This->designers);
+         free(This);
++    }
+ 
+     return ref;
+ }
+@@ -260,16 +268,49 @@
+     IHTMLEditDesigner *pIDesigner)
+ {
+     editsvcs *This = impl_from_IHTMLEditServices(iface);
+-    FIXME("(%p)->(%p)\n", This, pIDesigner);
+-    return E_NOTIMPL;
++    IHTMLEditDesigner **designers;
++    unsigned i;
++
++    TRACE("(%p)->(%p)\n", This, pIDesigner);
++
++    if(!pIDesigner)
++        return E_INVALIDARG;
++
++    for(i = 0; i < This->designer_cnt; i++) {
++        if(This->designers[i] == pIDesigner)
++            return E_INVALIDARG;
++    }
++
++    designers = realloc(This->designers, (This->designer_cnt + 1) * sizeof(*designers));
++    if(!designers)
++        return E_OUTOFMEMORY;
++
++    This->designers = designers;
++    IHTMLEditDesigner_AddRef(pIDesigner);
++    This->designers[This->designer_cnt++] = pIDesigner;
++    return S_OK;
+ }
+ 
+ static HRESULT WINAPI editsvcs_RemoveDesigner(IHTMLEditServices *iface,
+     IHTMLEditDesigner *pIDesigner)
+ {
+     editsvcs *This = impl_from_IHTMLEditServices(iface);
+-    FIXME("(%p)->(%p)\n", This, pIDesigner);
+-    return E_NOTIMPL;
++    unsigned i;
++
++    TRACE("(%p)->(%p)\n", This, pIDesigner);
++
++    for(i = 0; i < This->designer_cnt; i++) {
++        if(This->designers[i] != pIDesigner)
++            continue;
++
++        memmove(This->designers + i, This->designers + i + 1,
++                (This->designer_cnt - i - 1) * sizeof(*This->designers));
++        This->designer_cnt--;
++        IHTMLEditDesigner_Release(pIDesigner);
++        return S_OK;
++    }
++
++    return E_INVALIDARG;
+ }
+ 
+ static HRESULT WINAPI editsvcs_GetSelectionServices(IHTMLEditServices *iface,
+@@ -316,9 +357,80 @@
+     editsvcs_SelectRange,
+ };
+ 
++static const IHTMLEditServicesVtbl editsvcsVtbl;
++
++/* Take a referenced snapshot of the designer list, so that designers may add or
++ * remove themselves from within a callback. */
++static IHTMLEditDesigner **get_designers(IHTMLEditServices *iface, unsigned *cnt)
++{
++    IHTMLEditDesigner **ret;
++    editsvcs *This;
++    unsigned i;
++
++    *cnt = 0;
++    if(!iface || iface->lpVtbl != &editsvcsVtbl)
++        return NULL;
++
++    This = impl_from_IHTMLEditServices(iface);
++    if(!This->designer_cnt || !(ret = malloc(This->designer_cnt * sizeof(*ret))))
++        return NULL;
++
++    for(i = 0; i < This->designer_cnt; i++) {
++        ret[i] = This->designers[i];
++        IHTMLEditDesigner_AddRef(ret[i]);
++    }
++    *cnt = This->designer_cnt;
++    return ret;
++}
++
++BOOL has_edit_designers(IHTMLEditServices *iface)
++{
++    return iface && iface->lpVtbl == &editsvcsVtbl && impl_from_IHTMLEditServices(iface)->designer_cnt;
++}
++
++/* Returns S_OK if a designer consumed the event, S_FALSE otherwise. */
++HRESULT edit_designers_pre_handle(IHTMLEditServices *iface, DISPID id, IHTMLEventObj *event_obj)
++{
++    IHTMLEditDesigner **designers;
++    HRESULT hres, ret = S_FALSE;
++    unsigned i, cnt;
++
++    designers = get_designers(iface, &cnt);
++    for(i = 0; i < cnt; i++) {
++        if(ret != S_OK) {
++            hres = IHTMLEditDesigner_PreHandleEvent(designers[i], id, event_obj);
++            TRACE("designer %p PreHandleEvent(%ld) -> %08lx\n", designers[i], id, hres);
++            if(hres == S_OK)
++                ret = S_OK;
++        }
++        IHTMLEditDesigner_Release(designers[i]);
++    }
++    free(designers);
++    return ret;
++}
++
++void edit_designers_post_handle(IHTMLEditServices *iface, DISPID id, IHTMLEventObj *event_obj)
++{
++    IHTMLEditDesigner **designers;
++    unsigned i, cnt;
++    HRESULT hres;
++
++    designers = get_designers(iface, &cnt);
++    for(i = 0; i < cnt; i++) {
++        hres = IHTMLEditDesigner_PostHandleEvent(designers[i], id, event_obj);
++        TRACE("designer %p PostHandleEvent(%ld) -> %08lx\n", designers[i], id, hres);
++    }
++    for(i = 0; i < cnt; i++) {
++        hres = IHTMLEditDesigner_PostEditorEventNotify(designers[i], id, event_obj);
++        TRACE("designer %p PostEditorEventNotify(%ld) -> %08lx\n", designers[i], id, hres);
++        IHTMLEditDesigner_Release(designers[i]);
++    }
++    free(designers);
++}
++
+ static IHTMLEditServices *create_editsvcs(void)
+ {
+-    editsvcs *ret = malloc(sizeof(*ret));
++    editsvcs *ret = calloc(1, sizeof(*ret));
+ 
+     if (ret) {
+         ret->IHTMLEditServices_iface.lpVtbl = &editsvcsVtbl;
+--- a/dlls/ieframe/dochost.c
++++ b/dlls/ieframe/dochost.c
+@@ -348,6 +348,14 @@
+     IUnknown_AddRef(doc);
+     This->document = doc;
+ 
++    if(This->pending_html) {
++        IStream *stm = This->pending_html;
++
++        This->pending_html = NULL;
++        doc_host_load_html_stream(This, stm);
++        IStream_Release(stm);
++    }
++
+     hres = IUnknown_QueryInterface(doc, &IID_IOleObject, (void**)&oleobj);
+     if(SUCCEEDED(hres)) {
+         CLSID clsid;
+@@ -603,6 +611,11 @@
+ 
+     IUnknown_Release(This->document);
+     This->document = NULL;
++
++    if(This->pending_html) {
++        IStream_Release(This->pending_html);
++        This->pending_html = NULL;
++    }
+ }
+ 
+ HRESULT refresh_document(DocHost *This, const VARIANT *level)
+--- a/dlls/ieframe/frame.c
++++ b/dlls/ieframe/frame.c
+@@ -155,8 +155,28 @@
+                                                         WORD wID)
+ {
+     DocHost *This = impl_from_IOleInPlaceFrame(iface);
+-    FIXME("(%p)->(%p %d)\n", This, lpmsg, wID);
+-    return E_NOTIMPL;
++    IOleControlSite *site;
++    HRESULT hres = S_FALSE;
++
++    TRACE("(%p)->(%p %d)\n", This, lpmsg, wID);
++
++    /* real IE forwards keystrokes to the host's control site, which is where
++     * an embedding application installs its own accelerators (Enter to send). */
++    TRACE("msg %04x wparam %04lx wb %p\n", lpmsg->message, lpmsg->wParam, This->wb);
++
++    if(This->wb) {
++        WebBrowser *browser = CONTAINING_RECORD(This->wb, WebBrowser, IWebBrowser2_iface);
++
++        TRACE("client %p\n", browser->client);
++        if(browser->client && SUCCEEDED(IOleClientSite_QueryInterface(browser->client,
++                &IID_IOleControlSite, (void**)&site))) {
++            hres = IOleControlSite_TranslateAccelerator(site, lpmsg, 0);
++            IOleControlSite_Release(site);
++            TRACE("host TranslateAccelerator -> %08lx\n", hres);
++        }
++    }
++
++    return hres == S_OK ? S_OK : E_NOTIMPL;
+ }
+ 
+ #undef impl_from_IOleInPlaceFrame
+--- a/dlls/ieframe/ieframe.h
++++ b/dlls/ieframe/ieframe.h
+@@ -131,6 +131,7 @@
+     IOleCommandTarget *olecmd;
+ 
+     IUnknown *document;
++    IStream *pending_html;
+     IOleDocumentView *view;
+     IUnknown *doc_navigate;
+ 
+@@ -277,6 +278,7 @@
+ HRESULT go_back(DocHost*);
+ HRESULT go_forward(DocHost*);
+ HRESULT refresh_document(DocHost*,const VARIANT*);
++HRESULT doc_host_load_html_stream(DocHost*,IStream*);
+ HRESULT get_window(DocHost*,IHTMLWindow2**);
+ HRESULT get_location_url(DocHost*,BSTR*);
+ HRESULT set_dochost_url(DocHost*,const WCHAR*);
+--- a/dlls/ieframe/persist.c
++++ b/dlls/ieframe/persist.c
+@@ -239,10 +239,137 @@
+     return IPersistStorage_IsDirty(&This->IPersistStorage_iface);
+ }
+ 
++static IStream *copy_stream(IStream *src)
++{
++    IStream *dst = NULL;
++    LARGE_INTEGER zero = {0};
++    char buf[8192];
++    ULONG read;
++    HRESULT hres;
++
++    if(!src)
++        return NULL;
++
++    hres = CreateStreamOnHGlobal(NULL, TRUE, &dst);
++    if(FAILED(hres)) {
++        WARN("CreateStreamOnHGlobal failed: %08lx\n", hres);
++        return NULL;
++    }
++
++    IStream_Seek(src, zero, STREAM_SEEK_SET, NULL);
++    while(SUCCEEDED(hres = IStream_Read(src, buf, sizeof(buf), &read)) && read) {
++        hres = IStream_Write(dst, buf, read, NULL);
++        if(FAILED(hres)) {
++            IStream_Release(dst);
++            return NULL;
++        }
++    }
++
++    IStream_Seek(dst, zero, STREAM_SEEK_SET, NULL);
++    return dst;
++}
++
++/* Does this stream look like HTML rather than persisted control state? */
++static BOOL stream_is_html(IStream *stm)
++{
++    static const char bom_utf8[] = "\xef\xbb\xbf";
++    unsigned char head[512];
++    LARGE_INTEGER zero = {0};
++    ULONG read = 0, i = 0;
++    HRESULT hres;
++
++    IStream_Seek(stm, zero, STREAM_SEEK_SET, NULL);
++    hres = IStream_Read(stm, head, sizeof(head), &read);
++    IStream_Seek(stm, zero, STREAM_SEEK_SET, NULL);
++    if(FAILED(hres) || !read)
++        return FALSE;
++
++    if(read >= 3 && !memcmp(head, bom_utf8, 3))
++        i = 3;
++    /* UTF-16 BOM */
++    if(read >= 4 && (head[0] == 0xff && head[1] == 0xfe)) {
++        unsigned i2;
++        for(i2 = 2; i2 + 1 < read; i2 += 2)
++            if(head[i2] == '<' && head[i2+1] == 0)
++                return TRUE;
++        return FALSE;
++    }
++    if(read >= 2 && head[0] == 0xfe && head[1] == 0xff)
++        return FALSE;
++
++    while(i < read && (head[i] == ' ' || head[i] == '\t' || head[i] == '\r' || head[i] == '\n'))
++        i++;
++
++    return i < read && head[i] == '<';
++}
++
++/* Hand an HTML stream to the hosted document. */
++HRESULT doc_host_load_html_stream(DocHost *This, IStream *stm)
++{
++    IPersistStreamInit *psi;
++    LARGE_INTEGER zero = {0};
++    HRESULT hres;
++
++    if(!This->document || !stm)
++        return S_FALSE;
++
++    hres = IUnknown_QueryInterface(This->document, &IID_IPersistStreamInit, (void**)&psi);
++    if(FAILED(hres)) {
++        WARN("document has no IPersistStreamInit: %08lx\n", hres);
++        return hres;
++    }
++
++    IStream_Seek(stm, zero, STREAM_SEEK_SET, NULL);
++    TRACE("loading %p into document %p\n", stm, This->document);
++    hres = IPersistStreamInit_Load(psi, stm);
++    IPersistStreamInit_Release(psi);
++    if(FAILED(hres))
++        WARN("document stream load failed: %08lx\n", hres);
++    return hres;
++}
++
+ static HRESULT WINAPI PersistStreamInit_Load(IPersistStreamInit *iface, LPSTREAM pStg)
+ {
+     WebBrowser *This = impl_from_IPersistStreamInit(iface);
+-    FIXME("(%p)->(%p)\n", This, pStg);
++    HRESULT hres;
++
++    TRACE("(%p)->(%p)\n", This, pStg);
++
++    if(!pStg)
++        return E_INVALIDARG;
++
++    {
++        static int dbg_n;
++        char path[128];
++        IStream *cp = copy_stream(pStg);
++        if(cp) {
++            STATSTG st;
++            if(SUCCEEDED(IStream_Stat(cp, &st, STATFLAG_NONAME))) {
++                ULONG n = st.cbSize.QuadPart > 8192 ? 8192 : (ULONG)st.cbSize.QuadPart;
++                char *buf = malloc(n + 1);
++                ULONG got = 0;
++                IStream_Seek(cp, (LARGE_INTEGER){0}, STREAM_SEEK_SET, NULL);
++                IStream_Read(cp, buf, n, &got);
++                buf[got] = 0;
++                sprintf(path, "/tmp/iefstream-%02d.bin", dbg_n++);
++                FILE *fp = fopen(path, "wb");
++                if(fp) { fwrite(buf, 1, got, fp); fclose(fp); }
++                WARN("stream %s size=%lu head=[%.60s]\n", path, (unsigned long)got, buf);
++                free(buf);
++            }
++            IStream_Release(cp);
++        }
++    }
++
++    /* Persisted control state is not HTML; leave it alone. */
++    if(!stream_is_html(pStg))
++        return S_OK;
++
++    /* No document yet: keep the stream and load it once the document exists. */
++    This->doc_host.pending_html = copy_stream(pStg);
++    if(!This->doc_host.pending_html)
++        return E_OUTOFMEMORY;
++
+     return S_OK;
+ }
+ 
+--- a/dlls/ieframe/webbrowser.c
++++ b/dlls/ieframe/webbrowser.c
+@@ -1275,8 +1275,20 @@
+     DocHostContainer_set_url
+ };
+ 
++static void dbg_wb_log(const char *msg)
++{
++    FILE *f = fopen("/tmp/ief-wb.log", "a");
++    if(f) { fputs(msg, f); fputc('\n', f); fclose(f); }
++}
++
+ static HRESULT create_webbrowser(int version, IUnknown *outer, REFIID riid, void **ppv)
+ {
++    {
++        static int wb_n;
++        char buf[64];
++        sprintf(buf, "WB created #%d", ++wb_n);
++        dbg_wb_log(buf);
++    }
+     WebBrowser *ret;
+     HRESULT hres;
+ 
