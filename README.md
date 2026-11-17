@@ -114,10 +114,13 @@ So the feed has to be made robust in OBS; Wine cannot invent frames:
    log for `no more input formats` and toggle the source, forcing a fresh screencast
    negotiation.
 
-Verified: the OBS log and trace evidence above, and that the client survives a stalled
-producer without a restart. Not verified: the Program-output behaviour in this exact
-setup (it needs OBS's UI), and that a live preview still looks right at the clamped
-1280x720.
+Verified: the OBS log and trace evidence above; that the client survives a stalled
+producer without a restart; and the 1280x720 clamp in patch 0006, measured with the
+loopback deliberately left at 1920x1080 beforehand. Every open of `/dev/video10` then
+negotiated `Format: 24 bpp - 1280x720`, no 1080p samples (6,220,800 bytes) appeared,
+the preview works at that size, and the capture threads fell from roughly 40% of a
+core each to a few percent. Not verified: the Program-output behaviour in this exact
+setup, which needs OBS's UI.
 
 ## Rebuilding the patched Wine
 
