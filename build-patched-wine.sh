@@ -31,6 +31,12 @@
 #
 # Usage:  ./build-patched-wine.sh            apply/restore the series and build
 #         ./build-patched-wine.sh --check    report state only, change nothing
+#         ./build-patched-wine.sh --force    build even though Camfrog is running
+#
+# A build relinks the Wine libraries the client has mapped (qcap.so among them),
+# and Wine dies when its code pages are replaced underneath it: an seh crash with
+# "Exception frame is not in stack limits". The build therefore refuses to run
+# while Camfrog is live in the camfrog8 prefix, and --force overrides that.
 #
 # If wine-patches/base is missing, the script warns, prints the command that
 # recreates it, and falls back to checking each patch on its own against the
@@ -50,7 +56,20 @@ here=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 src=${WINE_SRC:-$HOME/wine-src-11.22}
 patchdir=$here/wine-patches
 jobs=${JOBS:-$(nproc 2>/dev/null || echo 4)}
-mode=${1:-build}
+mode=build
+force=no
+
+for arg in "$@"; do
+    case $arg in
+        --check) mode=--check ;;
+        --force) force=yes ;;
+        -h|--help)
+            sed -n '2,/^$/p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+            exit 0
+            ;;
+        *) echo "error: unknown argument: $arg (try --help)" >&2; exit 1 ;;
+    esac
+done
 
 [ -d "$src" ] || { echo "error: no Wine source tree at $src (set WINE_SRC=...)" >&2; exit 1; }
 [ -d "$patchdir" ] || { echo "error: missing patch directory: $patchdir" >&2; exit 1; }
@@ -59,6 +78,42 @@ patches=("$patchdir"/*.patch)
 [ -e "${patches[0]}" ] || { echo "error: no patches in $patchdir" >&2; exit 1; }
 
 cd "$src"
+
+camfrog_prefix=${WINEPREFIX:-$HOME/.local/share/wineprefixes/camfrog8}
+
+# Refuse to rebuild under a running client. --check only inspects, so it is never
+# blocked, and the closure test below is prefix-aware: a Camfrog in some other
+# prefix does not matter here.
+camfrog_pid=""
+if [ "$mode" != --check ]; then
+    for d in /proc/[0-9]*; do
+        img=$(readlink "$d/exe" 2>/dev/null) || continue
+        case ${img##*/} in
+            wine|wine64|wine-preloader|wineserver) ;;
+            *) continue ;;
+        esac
+        tr '\0' ' ' < "$d/cmdline" 2>/dev/null | grep -q "Camfrog Video Chat.exe" || continue
+        prefix=$(tr '\0' '\n' < "$d/environ" 2>/dev/null | sed -n 's/^WINEPREFIX=//p' | head -1)
+        if [ -z "$prefix" ]; then
+            tr '\0' ' ' < "$d/cmdline" 2>/dev/null | grep -q -- "$camfrog_prefix" || continue
+        else
+            [ "$prefix" = "$camfrog_prefix" ] || continue
+        fi
+        camfrog_pid=${d#/proc/}
+        break
+    done
+fi
+
+if [ -n "$camfrog_pid" ]; then
+    if [ "$force" != yes ]; then
+        echo "error: Camfrog is running (pid $camfrog_pid) in $camfrog_prefix." >&2
+        echo "       Building now relinks the Wine libraries that process has mapped," >&2
+        echo "       and Wine dies when its code pages are replaced underneath it." >&2
+        echo "       Close the client first, or pass --force if you accept the crash." >&2
+        exit 1
+    fi
+    echo "warning: Camfrog is running (pid $camfrog_pid); building anyway (--force)." >&2
+fi
 
 files=()
 replayed=""
