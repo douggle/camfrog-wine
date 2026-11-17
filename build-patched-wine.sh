@@ -21,6 +21,10 @@
 #   0005  qcap backs off 5 ms when the loopback reports a readable frame but
 #         read() has none, which v4l2loopback does for a frame it already handed
 #         out, so a stalled producer such as OBS costs no CPU.
+#   0006  qcap offers at most 1280x720 to applications. A loopback keeps whatever
+#         frame size the last reader left on it, so the client was asking for
+#         1920x1080 while OBS's canvas is 1280x720: two thirds of that copy and
+#         upload carried no extra detail.
 #
 # wine-patches/base holds the commit the series starts from (the Wine release the
 # patches were written against). The script replays the whole series onto that

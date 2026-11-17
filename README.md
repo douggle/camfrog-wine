@@ -52,7 +52,7 @@ never offered. Two things now make that hold across reboots and ordinary launche
   `/dev/video0..63`. It is committed on branch `camfrog-patched-wine` in
   `~/wine-src-11.22` (Wine 11.22, 64-bit build), and `build-patched-wine.sh` reapplies
   it and rebuilds if that tree is ever cleaned or recreated.
-- Four more patches fix the capture path itself. All five apply in order on top of
+- Five more patches fix the capture path itself. All six apply in order on top of
   the Wine release commit named in `wine-patches/base`:
 
   | Patch | What it fixes |
@@ -62,6 +62,7 @@ never offered. Two things now make that hold across reboots and ordinary launche
   | `0003-qcap-copy-rows-with-memcpy.patch` | the captured image was flipped byte by byte instead of a row at a time (6 MB of copying per 1080p frame) |
   | `0004-qcap-keep-the-stream-alive-on-errors.patch` | one failed `GetBuffer`, device read or `Receive` ended the capture thread for good, leaving a frozen picture; those now warn once and retry |
   | `0005-qcap-do-not-spin-when-the-loopback-is-idle.patch` | when the producer stalls, `v4l2loopback` still reports a readable frame, so the retry loop spun at full speed; it now backs off 5 ms |
+  | `0006-qcap-cap-the-offered-frame-size-at-720p.patch` | a loopback keeps the frame size the last reader left on it, so the client was capturing 1920x1080 while OBS's canvas is 1280x720; sizes are now clamped to 720p and the per-frame sample drops from 6.2 MB to 2.8 MB |
 
   The capture loop deliberately never gives up, so a camera stream survives a stalled
   producer (OBS pausing its virtual camera, for instance) and resumes by itself when
@@ -78,6 +79,45 @@ never offered. Two things now make that hold across reboots and ordinary launche
 
 The system Wine (`/usr/bin/wine`) is untouched; `teknoparrot`, Battle.net and the
 Camfrog 6.0 shortcuts still use it.
+
+### Why the preview freezes, and how to keep the feed alive
+
+The preview shows a few frames and then stops updating while the client stays
+responsive and the camera stays connected. The UI hang that used to come with it is
+gone (patch 0002); what is left is a starved camera. Where the frames stop, measured
+rather than guessed:
+
+- OBS's log ends the screencast at the moment of the freeze:
+  `[linux-vkcapture] Client 1 disconnected`, `[pipewire] Stream ... state: "paused"`,
+  then `state: "error" (error: no more input formats)` and `res:-32 (Broken pipe)`.
+- The virtual camera was set to output **Source → Screen Capture (PipeWire)**, so when
+  that one source fails OBS has nothing to give the virtual camera and `/dev/video10`
+  stops receiving writes. A display mode change (a fullscreen game switching
+  resolution) is enough to kill a PipeWire screencast.
+- In a Wine trace of a frozen session the capture loop was still cycling samples
+  (`BaseMemAllocator_GetBuffer`/`ReleaseBuffer` at 60 to 120 per second) while no
+  `Receive` and no `d3d9_swapchain_Present` followed: nothing was drawn because no new
+  frame arrived. With patch 0005 that cycling also costs no CPU.
+
+So the feed has to be made robust in OBS; Wine cannot invent frames:
+
+1. Set the virtual camera output to **Program** (or Scene) instead of a single source:
+   Controls dock → gear icon next to Start/Stop Virtual Camera. The compositor then
+   drives the virtual camera every frame, and a dead source contributes a blank area
+   instead of stopping the feed.
+2. Put a Color Source or image behind the screen capture, so the composite is never
+   empty.
+3. Avoid the mode change altogether: run fullscreen games in borderless-windowed mode
+   at a fixed resolution. The PipeWire source stores a `RestoreToken`, so re-attaching
+   to the same monitor needs no picker.
+4. Optional automatic re-arm: with `obs-websocket` enabled, a watchdog can watch OBS's
+   log for `no more input formats` and toggle the source, forcing a fresh screencast
+   negotiation.
+
+Verified: the OBS log and trace evidence above, and that the client survives a stalled
+producer without a restart. Not verified: the Program-output behaviour in this exact
+setup (it needs OBS's UI), and that a live preview still looks right at the clamped
+1280x720.
 
 ## Rebuilding the patched Wine
 

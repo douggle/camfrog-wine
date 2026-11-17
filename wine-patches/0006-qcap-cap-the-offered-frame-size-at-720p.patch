@@ -1,0 +1,73 @@
+diff --git a/dlls/qcap/v4l.c b/dlls/qcap/v4l.c
+index 2c7e091..a2f875f 100644
+--- a/dlls/qcap/v4l.c
++++ b/dlls/qcap/v4l.c
+@@ -56,6 +56,12 @@
+ #ifdef HAVE_LINUX_VIDEODEV2_H
+ 
+ WINE_DEFAULT_DEBUG_CHANNEL(quartz);
++
++/* Largest frame size offered to applications. The OBS virtual camera feeds a
++ * 1280x720 canvas by default, so asking the loopback for the 1920x1080 that some
++ * earlier reader left behind only costs a copy and an upload per frame. */
++#define MAX_CAPTURE_WIDTH  1280
++#define MAX_CAPTURE_HEIGHT 720
+ WINE_DECLARE_DEBUG_CHANNEL(winediag);
+ 
+ static typeof(open) *video_open = open;
+@@ -501,6 +507,7 @@ static NTSTATUS v4l_device_create( void *args )
+     BOOL have_libv4l2;
+     char path[20];
+     HRESULT hr;
++    unsigned int width, height;
+     int fd, i;
+ 
+     have_libv4l2 = video_init();
+@@ -613,11 +620,46 @@ static NTSTATUS v4l_device_create( void *args )
+         if (max_frame_interval < min_frame_interval)
+             ERR("Failed to get fps: %s.\n", strerror(errno));
+ 
++        /* Cap the size we offer. A loopback such as the OBS virtual camera is
++         * fed from a canvas that is usually smaller than the size the last
++         * reader left on the device, and every extra pixel costs a copy and an
++         * upload per frame with no extra detail to show for it. */
++        width = frmsize.discrete.width;
++        height = frmsize.discrete.height;
++        if (width > MAX_CAPTURE_WIDTH || height > MAX_CAPTURE_HEIGHT)
++        {
++            if ((LONGLONG)width * MAX_CAPTURE_HEIGHT > (LONGLONG)height * MAX_CAPTURE_WIDTH)
++            {
++                height = (LONGLONG)height * MAX_CAPTURE_WIDTH / width;
++                width = MAX_CAPTURE_WIDTH;
++            }
++            else
++            {
++                width = (LONGLONG)width * MAX_CAPTURE_HEIGHT / height;
++                height = MAX_CAPTURE_HEIGHT;
++            }
++            /* even dimensions keep 4:2:2 and 4:2:0 sources happy */
++            width &= ~1;
++            height &= ~1;
++        }
++
++        for (i = 0; i < device->caps_count; ++i)
++            if (device->caps[i].pixelformat == format.fmt.pix.pixelformat
++                    && device->caps[i].video_info.bmiHeader.biWidth == width
++                    && device->caps[i].video_info.bmiHeader.biHeight == height)
++                break;
++        if (i < device->caps_count)
++        {
++            /* the clamp made two enumerated sizes identical */
++            frmsize.index++;
++            continue;
++        }
++
+         new_caps = realloc(device->caps, (device->caps_count + 1) * sizeof(*device->caps));
+         if (!new_caps)
+             goto error;
+         device->caps = new_caps;
+-        fill_caps(format.fmt.pix.pixelformat, frmsize.discrete.width, frmsize.discrete.height,
++        fill_caps(format.fmt.pix.pixelformat, width, height,
+                 max_frame_interval, min_frame_interval, &device->caps[device->caps_count]);
+         device->caps_count++;
+ 
