@@ -1,0 +1,97 @@
+diff --git a/dlls/qcap/qcap_private.h b/dlls/qcap/qcap_private.h
+index 9f771a7..3e98885 100644
+--- a/dlls/qcap/qcap_private.h
++++ b/dlls/qcap/qcap_private.h
+@@ -140,6 +140,10 @@ struct read_frame_params
+     void                        *data;
+ };
+ 
++/* Returned by unix_read_frame when no frame became available in time. The
++ * caller is expected to check its own state and call again. */
++#define V4L_E_FRAME_TIMEOUT HRESULT_FROM_WIN32(ERROR_TIMEOUT)
++
+ enum unix_funcs
+ {
+     unix_create,
+diff --git a/dlls/qcap/v4l.c b/dlls/qcap/v4l.c
+index a963372..f6218a4 100644
+--- a/dlls/qcap/v4l.c
++++ b/dlls/qcap/v4l.c
+@@ -45,6 +45,7 @@
+ #include <linux/videodev2.h>
+ #endif
+ #include <unistd.h>
++#include <poll.h>
+ 
+ #include "ntstatus.h"
+ #include "initguid.h"
+@@ -355,14 +356,38 @@ static NTSTATUS v4l_device_read_frame( void *args )
+ {
+     const struct read_frame_params *params = args;
+     struct video_capture_device *device = get_device(params->device);
++    struct pollfd pollfd = {.fd = device->fd, .events = POLLIN};
++    int ret;
+ 
+-    while (video_read(device->fd, device->image_data, device->image_size) < 0)
++    for (;;)
+     {
++        if (video_read(device->fd, device->image_data, device->image_size) >= 0)
++            break;
++
+         if (errno != EAGAIN)
+         {
+             ERR("Failed to read frame: %s\n", strerror(errno));
+             return FALSE;
+         }
++
++        /* The descriptor is non-blocking, so retrying the read immediately
++         * spins at full speed for as long as no frame is available, and the
++         * capture thread then never notices that it was asked to stop. Wait
++         * for the device instead, and hand control back to the caller when
++         * nothing arrives, so that it can check its state and call again. */
++        if ((ret = poll(&pollfd, 1, 100)) < 0)
++        {
++            if (errno == EINTR) continue;
++            ERR("Failed to wait for frame: %s\n", strerror(errno));
++            return FALSE;
++        }
++        if (!ret)
++            return V4L_E_FRAME_TIMEOUT;
++        if (pollfd.revents & (POLLERR | POLLHUP | POLLNVAL))
++        {
++            ERR("Error while waiting for a frame, revents %#x.\n", pollfd.revents);
++            return FALSE;
++        }
+     }
+ 
+     reverse_image(device, params->data, device->image_data);
+diff --git a/dlls/qcap/vfwcapture.c b/dlls/qcap/vfwcapture.c
+index 97f79c9..eb4cd5e 100644
+--- a/dlls/qcap/vfwcapture.c
++++ b/dlls/qcap/vfwcapture.c
+@@ -148,6 +148,7 @@ static DWORD WINAPI stream_thread(void *arg)
+     {
+         IMediaSample *sample;
+         HRESULT hr;
++        NTSTATUS status;
+         BYTE *data;
+ 
+         EnterCriticalSection(&filter->state_cs);
+@@ -174,7 +175,16 @@ static DWORD WINAPI stream_thread(void *arg)
+ 
+         params.device = filter->device;
+         params.data = data;
+-        if (!V4L_CALL( read_frame, &params ))
++        status = V4L_CALL( read_frame, &params );
++        if (status == V4L_E_FRAME_TIMEOUT)
++        {
++            /* No frame arrived in time. Loop back to the top so that a stop or
++             * pause request is noticed instead of waiting on a device that may
++             * never deliver another frame. */
++            IMediaSample_Release(sample);
++            continue;
++        }
++        if (!status)
+         {
+             IMediaSample_Release(sample);
+             break;

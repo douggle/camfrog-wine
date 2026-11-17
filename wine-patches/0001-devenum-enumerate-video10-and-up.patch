@@ -1,0 +1,15 @@
+diff --git a/dlls/devenum/createdevenum.c b/dlls/devenum/createdevenum.c
+index ea8e770..b902353 100644
+--- a/dlls/devenum/createdevenum.c
++++ b/dlls/devenum/createdevenum.c
+@@ -723,7 +723,9 @@ static void register_avicap_devices(void)
+     HRESULT hr;
+     int i = 0;
+ 
+-    for (i = 0; i < 10; ++i)
++    /* v4l2loopback and other virtual drivers can allocate indices well above
++     * 9, so scan the full /dev/videoN range the kernel allows. */
++    for (i = 0; i < 64; ++i)
+     {
+         if (!capGetDriverDescriptionW(i, friendlyname, ARRAY_SIZE(friendlyname),
+                 version, ARRAY_SIZE(version)))

@@ -1,0 +1,44 @@
+diff --git a/dlls/qcap/v4l.c b/dlls/qcap/v4l.c
+index f6218a4..f71ac82 100644
+--- a/dlls/qcap/v4l.c
++++ b/dlls/qcap/v4l.c
+@@ -46,6 +46,7 @@
+ #endif
+ #include <unistd.h>
+ #include <poll.h>
++#include <string.h>
+ 
+ #include "ntstatus.h"
+ #include "initguid.h"
+@@ -335,21 +336,21 @@ static NTSTATUS v4l_device_set_prop( void *args )
+ 
+ static void reverse_image(struct video_capture_device *device, LPBYTE output, const BYTE *input)
+ {
+-    int inoffset, outoffset, pitch;
++    const unsigned int pitch = device->image_pitch;
++    unsigned int inoffset = 0, outoffset = device->image_size;
+ 
+-    /* the whole image needs to be reversed,
+-       because the dibs are messed up in windows */
+-    outoffset = device->image_size;
+-    pitch = device->image_pitch;
+-    inoffset = 0;
+-    while (outoffset > 0)
++    /* The whole image needs to be reversed, because the dibs are messed up in
++     * windows. Copy it a whole row at a time: this runs for every frame, and at
++     * 1920x1080 that is over 6 MB that a byte loop would move one byte at a
++     * time. */
++    while (outoffset >= pitch)
+     {
+-        int x;
+         outoffset -= pitch;
+-        for (x = 0; x < pitch; x++)
+-            output[outoffset + x] = input[inoffset + x];
++        memcpy(output + outoffset, input + inoffset, pitch);
+         inoffset += pitch;
+     }
++    if (outoffset)
++        memcpy(output, input + inoffset, outoffset);
+ }
+ 
+ static NTSTATUS v4l_device_read_frame( void *args )

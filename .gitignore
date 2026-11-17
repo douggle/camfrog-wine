@@ -10,3 +10,14 @@ camfrog/*
 !camfrog/*.py
 !camfrog/*.sh
 !camfrog/*.patch
+!wine-patches/
+wine-patches/*
+!wine-patches/*.patch
+# build-patched-wine.sh replays the series onto this commit; without it a fresh
+# clone cannot verify or rebuild the patched tree.
+!wine-patches/base
+!v4l2loopback/
+v4l2loopback/*
+!v4l2loopback/*.conf
+!build-patched-wine.sh
+!camfrog-wine.sh

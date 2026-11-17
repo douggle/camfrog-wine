@@ -1,0 +1,17 @@
+diff --git a/dlls/qcap/v4l.c b/dlls/qcap/v4l.c
+index f71ac82..2c7e091 100644
+--- a/dlls/qcap/v4l.c
++++ b/dlls/qcap/v4l.c
+@@ -389,6 +389,12 @@ static NTSTATUS v4l_device_read_frame( void *args )
+             ERR("Error while waiting for a frame, revents %#x.\n", pollfd.revents);
+             return FALSE;
+         }
++
++        /* The loopback can report a frame as waiting while the producer has
++         * not written a new one, in which case read() keeps failing with
++         * EAGAIN as fast as we can retry. Wait for the next frame instead of
++         * burning a core until it arrives. */
++        usleep(5000);
+     }
+ 
+     reverse_image(device, params->data, device->image_data);
