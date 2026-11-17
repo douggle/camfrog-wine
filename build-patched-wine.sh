@@ -25,6 +25,9 @@
 #         frame size the last reader left on it, so the client was asking for
 #         1920x1080 while OBS's canvas is 1280x720: two thirds of that copy and
 #         upload carried no extra detail.
+#   0007  that cap applies to loopback devices only. Real hardware, such as a
+#         1080p webcam, keeps offering all of its modes; the device is a loopback
+#         when VIDIOC_QUERYCAP reports a v4l2 loopback driver or bus info.
 #
 # wine-patches/base holds the commit the series starts from (the Wine release the
 # patches were written against). The script replays the whole series onto that

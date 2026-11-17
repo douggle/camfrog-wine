@@ -1,0 +1,54 @@
+diff --git a/dlls/qcap/v4l.c b/dlls/qcap/v4l.c
+index a2f875f..1abd221 100644
+--- a/dlls/qcap/v4l.c
++++ b/dlls/qcap/v4l.c
+@@ -504,7 +504,7 @@ static NTSTATUS v4l_device_create( void *args )
+     struct video_capture_device *device;
+     struct v4l2_capability caps = {{0}};
+     struct v4l2_format format = {0};
+-    BOOL have_libv4l2;
++    BOOL have_libv4l2, is_loopback;
+     char path[20];
+     HRESULT hr;
+     unsigned int width, height;
+@@ -558,6 +558,13 @@ static NTSTATUS v4l_device_create( void *args )
+         goto error;
+     }
+ 
++    /* The size clamp below only makes sense for loopback devices: their size is
++     * whatever the last reader left behind rather than a property of real
++     * hardware, and a capture card or webcam should keep offering everything it
++     * has. */
++    is_loopback = !strcmp((const char *)caps.driver, "v4l2 loopback")
++            || strstr((const char *)caps.bus_info, "v4l2loopback");
++
+     format.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+     if (xioctl(fd, VIDIOC_G_FMT, &format) == -1)
+     {
+@@ -620,13 +627,13 @@ static NTSTATUS v4l_device_create( void *args )
+         if (max_frame_interval < min_frame_interval)
+             ERR("Failed to get fps: %s.\n", strerror(errno));
+ 
+-        /* Cap the size we offer. A loopback such as the OBS virtual camera is
+-         * fed from a canvas that is usually smaller than the size the last
+-         * reader left on the device, and every extra pixel costs a copy and an
+-         * upload per frame with no extra detail to show for it. */
++        /* Cap the size we offer a loopback. The OBS virtual camera is fed from a
++         * canvas that is usually smaller than the size the last reader left on
++         * the device, and every extra pixel costs a copy and an upload per frame
++         * with no extra detail to show for it. Real devices are left alone. */
+         width = frmsize.discrete.width;
+         height = frmsize.discrete.height;
+-        if (width > MAX_CAPTURE_WIDTH || height > MAX_CAPTURE_HEIGHT)
++        if (is_loopback && (width > MAX_CAPTURE_WIDTH || height > MAX_CAPTURE_HEIGHT))
+         {
+             if ((LONGLONG)width * MAX_CAPTURE_HEIGHT > (LONGLONG)height * MAX_CAPTURE_WIDTH)
+             {
+@@ -661,6 +668,7 @@ static NTSTATUS v4l_device_create( void *args )
+         device->caps = new_caps;
+         fill_caps(format.fmt.pix.pixelformat, width, height,
+                 max_frame_interval, min_frame_interval, &device->caps[device->caps_count]);
++        TRACE("Offering %ux%u%s.\n", width, height, is_loopback ? " (loopback)" : "");
+         device->caps_count++;
+ 
+         frmsize.index++;

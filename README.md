@@ -52,7 +52,7 @@ never offered. Two things now make that hold across reboots and ordinary launche
   `/dev/video0..63`. It is committed on branch `camfrog-patched-wine` in
   `~/wine-src-11.22` (Wine 11.22, 64-bit build), and `build-patched-wine.sh` reapplies
   it and rebuilds if that tree is ever cleaned or recreated.
-- Five more patches fix the capture path itself. All six apply in order on top of
+- Six more patches fix the capture path itself. All seven apply in order on top of
   the Wine release commit named in `wine-patches/base`:
 
   | Patch | What it fixes |
@@ -63,6 +63,7 @@ never offered. Two things now make that hold across reboots and ordinary launche
   | `0004-qcap-keep-the-stream-alive-on-errors.patch` | one failed `GetBuffer`, device read or `Receive` ended the capture thread for good, leaving a frozen picture; those now warn once and retry |
   | `0005-qcap-do-not-spin-when-the-loopback-is-idle.patch` | when the producer stalls, `v4l2loopback` still reports a readable frame, so the retry loop spun at full speed; it now backs off 5 ms |
   | `0006-qcap-cap-the-offered-frame-size-at-720p.patch` | a loopback keeps the frame size the last reader left on it, so the client was capturing 1920x1080 while OBS's canvas is 1280x720; sizes are now clamped to 720p and the per-frame sample drops from 6.2 MB to 2.8 MB |
+  | `0007-qcap-clamp-only-loopback-devices.patch` | 0006 capped every device, which took 1080p away from the Logitech webcam; the cap now applies only when `VIDIOC_QUERYCAP` reports a `v4l2 loopback` driver (or `v4l2loopback` bus info), and every offered size is traced |
 
   The capture loop deliberately never gives up, so a camera stream survives a stalled
   producer (OBS pausing its virtual camera, for instance) and resumes by itself when
