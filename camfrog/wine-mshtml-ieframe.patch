@@ -65,10 +65,29 @@
      return S_OK;
  }
  
-@@ -3407,6 +3463,62 @@
+@@ -3407,6 +3463,81 @@
      return E_NOTIMPL;
  }
  
++static const WCHAR *element_tag_name(HTMLElement *elem)
++{
++    static WCHAR buf[32];
++    const PRUnichar *tag = NULL;
++    nsAString tag_str;
++
++    buf[0] = 0;
++    if(!elem->dom_element)
++        return buf;
++
++    nsAString_Init(&tag_str, NULL);
++    if(NS_SUCCEEDED(nsIDOMElement_GetTagName(elem->dom_element, &tag_str)))
++        nsAString_GetData(&tag_str, &tag);
++    if(tag)
++        lstrcpynW(buf, tag, ARRAY_SIZE(buf));
++    nsAString_Finish(&tag_str);
++    return buf;
++}
++
 +static BOOL is_body_element(HTMLElement *elem)
 +{
 +    const PRUnichar *tag;
@@ -128,7 +147,7 @@
  static HRESULT WINAPI HTMLElement2_get_scrollHeight(IHTMLElement2 *iface, LONG *p)
  {
      HTMLElement *This = impl_from_IHTMLElement2(iface);
-@@ -3421,6 +3533,20 @@
+@@ -3421,6 +3552,28 @@
  
      nsres = nsIDOMElement_GetScrollHeight(This->dom_element, p);
      assert(nsres == NS_OK);
@@ -145,11 +164,19 @@
 +            *p = content_height;
 +        }
 +    }
++    else
++    {
++        LONG client_height = 0;
++
++        nsIDOMElement_GetClientHeight(This->dom_element, &client_height);
++        TRACE("tag %s: scroll %ld, client %ld, fits %d\n", debugstr_w(element_tag_name(This)),
++                *p, client_height, *p <= client_height);
++    }
 +
      TRACE("*p = %ld\n", *p);
      return S_OK;
  }
-@@ -3594,9 +3720,38 @@
+@@ -3594,9 +3747,38 @@
  
  static HRESULT WINAPI HTMLElement2_get_canHandleChildren(IHTMLElement2 *iface, VARIANT_BOOL *p)
  {

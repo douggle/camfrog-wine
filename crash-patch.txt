@@ -142,3 +142,16 @@ removes anything there after 10 days) to ~/camfrog/wine-src/wine-wine-11.21, wit
 tarball next to it as ~/camfrog/wine-src/wine-11.21.tar.gz.  Verified after the move:
 "make -j16 dlls/mf/all dlls/mshtml/all dlls/ieframe/all" rebuilds from the new location.
 wine-src/ is not part of the git repo (see .gitignore); the two .patch files are.
+
+--- mshtml diagnostic tracing for the private-message box (Nov 17) ---
+The mshtml.dll installed in the camfrog8 prefix is a diagnostic build: htmlelem.c
+gained element_tag_name() and HTMLElement2_get_scrollHeight now traces
+"tag %s: scroll %ld, client %ld, fits %d" for every non-BODY element. The room fix
+keys on BODY, so this prints what a private-message window measures instead. Tracing
+is only emitted with WINEDEBUG=+mshtml; the behaviour of the getter is unchanged.
+camfrog/wine-mshtml-ieframe.patch was regenerated from the tree so it reproduces the
+installed build exactly (pristine wine-11.21 tarball + patch == the 12 patched files,
+byte for byte).
+Rebuild/install as above: make -j16 dlls/mshtml/all, stop the client, overwrite the 16
+bytes at 0x40 with "Camfrog native!", copy to system32 (old copy kept as
+mshtml.dll.before-pmfix).
